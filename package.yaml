@@ -1,0 +1,537 @@
+# =============================================================================
+# luminary-ha — Motion-activated lighting package for Home Assistant
+# =============================================================================
+#
+# SETUP: Before using, replace all occurrences of the placeholder strings
+#   below with values for your specific room/zone:
+#
+#   ROOM_NAME      → friendly name, e.g. "Hallway"
+#   ZONE           → entity prefix,  e.g. "hallway"
+#   SWITCH_DEVICE  → Z-Wave switch device_id from your HA device registry
+#   LIGHT_ENTITY   → entity_id of the light, e.g. "light.hallway_lights"
+#   SENSOR_1/2/3   → entity_ids of the three motion sensors
+#
+#   Quick rename (Linux/macOS):
+#     sed -i 's/ZONE/hallway/g; s/ROOM_NAME/Hallway/g' package.yaml
+#
+#   A setup wizard script is provided in scripts/setup.sh
+#
+# REQUIREMENTS: Home Assistant 2024.1+, Z-Wave JS integration
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# INPUT HELPERS — exposed as sliders/pickers on the dashboard card
+# -----------------------------------------------------------------------------
+input_boolean:
+
+  ZONE_motion_blocker:
+    name: "ROOM_NAME — Manual Override"
+    icon: mdi-hand-back-right
+
+  ZONE_automation_disabled:
+    name: "ROOM_NAME — Automation Disabled"
+    icon: mdi-robot-off
+
+
+input_number:
+
+  ZONE_motion_timeout_min:
+    name: "ROOM_NAME — Stuck Sensor Timeout"
+    min: 1
+    max: 30
+    step: 1
+    initial: 2
+    unit_of_measurement: min
+    icon: mdi-timer-outline
+
+  ZONE_sun_elevation_threshold:
+    name: "ROOM_NAME — Sun Elevation Threshold"
+    min: -18
+    max: 15
+    step: 0.5
+    initial: 3
+    unit_of_measurement: "°"
+    icon: mdi-weather-sunset
+
+  ZONE_lux_threshold:
+    name: "ROOM_NAME — Lux Threshold"
+    min: 0
+    max: 1000
+    step: 5
+    initial: 50
+    unit_of_measurement: lx
+    icon: mdi-brightness-5
+
+  ZONE_dim_brightness:
+    name: "ROOM_NAME — Dim Brightness"
+    min: 1
+    max: 100
+    step: 1
+    initial: 10
+    unit_of_measurement: "%"
+    icon: mdi-brightness-2
+
+  ZONE_normal_brightness:
+    name: "ROOM_NAME — Normal Brightness"
+    min: 1
+    max: 100
+    step: 1
+    initial: 100
+    unit_of_measurement: "%"
+    icon: mdi-brightness-7
+
+
+input_datetime:
+
+  ZONE_dim_start:
+    name: "ROOM_NAME — Dim Window Start"
+    has_time: true
+    has_date: false
+    initial: "00:00:00"
+    icon: mdi-weather-night
+
+  ZONE_dim_end:
+    name: "ROOM_NAME — Dim Window End"
+    has_time: true
+    has_date: false
+    initial: "06:00:00"
+    icon: mdi-weather-sunrise
+
+
+input_select:
+
+  ZONE_daytime_mode:
+    name: "ROOM_NAME — Daytime Suppression Mode"
+    options:
+      - Sun Elevation
+      - Lux Sensor
+    initial: Sun Elevation
+    icon: mdi-theme-light-dark
+
+
+input_text:
+
+  ZONE_lux_sensor_entity:
+    name: "ROOM_NAME — Lux Sensor Entity ID"
+    initial: ""
+    max: 100
+    icon: mdi-eye
+
+
+# -----------------------------------------------------------------------------
+# TEMPLATE SENSOR — status indicator for the dashboard
+# -----------------------------------------------------------------------------
+template:
+  - sensor:
+      - name: "ROOM_NAME Automation Status"
+        unique_id: ZONE_automation_status
+        icon: >
+          {% if is_state('input_boolean.ZONE_automation_disabled', 'on') %}
+            mdi-robot-off
+          {% elif is_state('input_boolean.ZONE_motion_blocker', 'on') %}
+            mdi-hand-back-right
+          {% else %}
+            mdi-motion-sensor
+          {% endif %}
+        state: >
+          {% if is_state('input_boolean.ZONE_automation_disabled', 'on') %}
+            Disabled
+          {% elif is_state('input_boolean.ZONE_motion_blocker', 'on') %}
+            Manual Override
+          {% else %}
+            {% if is_state('input_select.ZONE_daytime_mode', 'Sun Elevation') %}
+              {% if state_attr('sun.sun', 'elevation') | float(0) < states('input_number.ZONE_sun_elevation_threshold') | float(3) %}
+                Automated
+              {% else %}
+                Standby
+              {% endif %}
+            {% else %}
+              {% set lux_entity = states('input_text.ZONE_lux_sensor_entity') %}
+              {% if lux_entity == '' or states(lux_entity) in ['unknown', 'unavailable', 'none'] %}
+                Automated
+              {% elif states(lux_entity) | float(999) < states('input_number.ZONE_lux_threshold') | float(50) %}
+                Automated
+              {% else %}
+                Standby
+              {% endif %}
+            {% endif %}
+          {% endif %}
+
+
+# -----------------------------------------------------------------------------
+# SCRIPT — shared brightness setter (used by motion + switch-release automations)
+# -----------------------------------------------------------------------------
+script:
+
+  ZONE_set_brightness:
+    alias: "ROOM_NAME — Set Time-Appropriate Brightness"
+    icon: mdi-brightness-auto
+    sequence:
+      - variables:
+          in_dim_window: >
+            {% set start = states('input_datetime.ZONE_dim_start')[11:16] %}
+            {% set end   = states('input_datetime.ZONE_dim_end')[11:16] %}
+            {% set t     = now().strftime('%H:%M') %}
+            {% if start <= end %}
+              {{ start <= t < end }}
+            {% else %}
+              {{ t >= start or t < end }}
+            {% endif %}
+          brightness_pct: >
+            {% set start = states('input_datetime.ZONE_dim_start')[11:16] %}
+            {% set end   = states('input_datetime.ZONE_dim_end')[11:16] %}
+            {% set t     = now().strftime('%H:%M') %}
+            {% set in_dim = (start <= end and start <= t < end) or (start > end and (t >= start or t < end)) %}
+            {% if in_dim %}
+              {{ states('input_number.ZONE_dim_brightness') | int(10) }}
+            {% else %}
+              {{ states('input_number.ZONE_normal_brightness') | int(100) }}
+            {% endif %}
+      - action: light.turn_on
+        target:
+          entity_id: LIGHT_ENTITY
+        data:
+          brightness_pct: "{{ brightness_pct | int }}"
+          transition: 1
+
+
+# -----------------------------------------------------------------------------
+# AUTOMATIONS
+# -----------------------------------------------------------------------------
+automation:
+
+  # ---------------------------------------------------------------------------
+  # 1. MAIN MOTION — core logic
+  # ---------------------------------------------------------------------------
+  - id: ZONE_motion_lights
+    alias: "ROOM_NAME — Motion Lights"
+    description: >
+      Turns on ROOM_NAME lights on motion detection. Respects daytime suppression
+      (sun elevation or lux), dim window brightness profile, manual override, and
+      disabled (dumb switch) mode. Includes stuck-sensor safety timeout.
+    mode: restart
+
+    trigger:
+      - platform: state
+        entity_id:
+          - SENSOR_1
+          - SENSOR_2
+          - SENSOR_3
+        to: "on"
+
+    condition:
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.ZONE_motion_blocker
+        state: "off"
+      # Daytime suppression — passes when it's dark enough
+      - condition: or
+        conditions:
+          # Sun elevation mode: activate when sun is below threshold
+          - condition: and
+            conditions:
+              - condition: template
+                value_template: "{{ is_state('input_select.ZONE_daytime_mode', 'Sun Elevation') }}"
+              - condition: template
+                value_template: >
+                  {{ state_attr('sun.sun', 'elevation') | float(0)
+                     < states('input_number.ZONE_sun_elevation_threshold') | float(3) }}
+          # Lux mode: activate when lux is below threshold (fail-safe: unavailable = treat as dark)
+          - condition: and
+            conditions:
+              - condition: template
+                value_template: "{{ is_state('input_select.ZONE_daytime_mode', 'Lux Sensor') }}"
+              - condition: template
+                value_template: >
+                  {% set entity = states('input_text.ZONE_lux_sensor_entity') %}
+                  {% if entity == '' or states(entity) in ['unknown', 'unavailable', 'none'] %}
+                    true
+                  {% else %}
+                    {{ states(entity) | float(999) < states('input_number.ZONE_lux_threshold') | float(50) }}
+                  {% endif %}
+
+    action:
+      # Turn on at time-appropriate brightness
+      - action: script.ZONE_set_brightness
+
+      # Compute timeout from slider before waiting
+      - variables:
+          motion_timeout: >
+            {% set mins = states('input_number.ZONE_motion_timeout_min') | int(2) %}
+            {{ '%02d:%02d:00' % (mins // 60, mins % 60) }}
+
+      # Wait for all sensors to clear, or until safety timeout
+      # mode: restart means any new motion trigger resets this entire sequence,
+      # which also resets the timeout clock — no extra logic needed.
+      - wait_for_trigger:
+          - platform: template
+            value_template: >
+              {{ states('SENSOR_1') == 'off'
+                 and states('SENSOR_2') == 'off'
+                 and states('SENSOR_3') == 'off' }}
+        timeout: "{{ motion_timeout }}"
+        continue_on_timeout: true
+
+      # Re-check overrides before turning off (could have changed during the wait)
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.ZONE_motion_blocker
+        state: "off"
+
+      - action: light.turn_off
+        target:
+          entity_id: LIGHT_ENTITY
+        data:
+          transition: 1
+
+
+  # ---------------------------------------------------------------------------
+  # 2. SINGLE TAP UP — manual on (full bright + enable override)
+  # ---------------------------------------------------------------------------
+  - id: ZONE_switch_single_up
+    alias: "ROOM_NAME — Switch Single Tap Up (Manual On)"
+    mode: single
+    trigger:
+      - platform: device
+        device_id: SWITCH_DEVICE
+        domain: zwave_js
+        type: event.value_notification.central_scene
+        property: scene
+        property_key: "001"
+        endpoint: 0
+        command_class: 91
+        subtype: "Endpoint 0 Scene 001"
+        value: 0
+    condition:
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+    action:
+      - action: light.turn_on
+        target:
+          entity_id: LIGHT_ENTITY
+        data:
+          brightness_pct: 100
+          transition: 1
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.ZONE_motion_blocker
+
+
+  # ---------------------------------------------------------------------------
+  # 3. SINGLE TAP DOWN — release manual override, return to auto brightness
+  # ---------------------------------------------------------------------------
+  - id: ZONE_switch_single_down
+    alias: "ROOM_NAME — Switch Single Tap Down (Return to Auto)"
+    mode: single
+    trigger:
+      - platform: device
+        device_id: SWITCH_DEVICE
+        domain: zwave_js
+        type: event.value_notification.central_scene
+        property: scene
+        property_key: "002"
+        endpoint: 0
+        command_class: 91
+        subtype: "Endpoint 0 Scene 002"
+        value: 0
+    condition:
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+    action:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.ZONE_motion_blocker
+      # If any sensor currently detects motion, set appropriate brightness.
+      # Otherwise turn off and let motion re-trigger.
+      - choose:
+          - conditions:
+              - condition: or
+                conditions:
+                  - condition: state
+                    entity_id: SENSOR_1
+                    state: "on"
+                  - condition: state
+                    entity_id: SENSOR_2
+                    state: "on"
+                  - condition: state
+                    entity_id: SENSOR_3
+                    state: "on"
+            sequence:
+              - action: script.ZONE_set_brightness
+        default:
+          - action: light.turn_off
+            target:
+              entity_id: LIGHT_ENTITY
+            data:
+              transition: 1
+
+
+  # ---------------------------------------------------------------------------
+  # 4. DOUBLE TAP UP — enable dumb mode (automation fully disabled)
+  # ---------------------------------------------------------------------------
+  - id: ZONE_switch_double_up
+    alias: "ROOM_NAME — Switch Double Tap Up (Disable Automation)"
+    mode: single
+    trigger:
+      - platform: device
+        device_id: SWITCH_DEVICE
+        domain: zwave_js
+        type: event.value_notification.central_scene
+        property: scene
+        property_key: "001"
+        endpoint: 0
+        command_class: 91
+        subtype: "Endpoint 0 Scene 001"
+        value: 3
+    action:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.ZONE_automation_disabled
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.ZONE_motion_blocker
+      - action: light.turn_off
+        target:
+          entity_id: LIGHT_ENTITY
+        data:
+          transition: 1
+
+
+  # ---------------------------------------------------------------------------
+  # 5. DOUBLE TAP DOWN — disable dumb mode (re-enable automation)
+  # ---------------------------------------------------------------------------
+  - id: ZONE_switch_double_down
+    alias: "ROOM_NAME — Switch Double Tap Down (Re-enable Automation)"
+    mode: single
+    trigger:
+      - platform: device
+        device_id: SWITCH_DEVICE
+        domain: zwave_js
+        type: event.value_notification.central_scene
+        property: scene
+        property_key: "002"
+        endpoint: 0
+        command_class: 91
+        subtype: "Endpoint 0 Scene 002"
+        value: 3
+    action:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.ZONE_automation_disabled
+      - choose:
+          - conditions:
+              - condition: or
+                conditions:
+                  - condition: state
+                    entity_id: SENSOR_1
+                    state: "on"
+                  - condition: state
+                    entity_id: SENSOR_2
+                    state: "on"
+                  - condition: state
+                    entity_id: SENSOR_3
+                    state: "on"
+            sequence:
+              - action: script.ZONE_set_brightness
+        default:
+          - action: light.turn_off
+            target:
+              entity_id: LIGHT_ENTITY
+            data:
+              transition: 1
+
+
+  # ---------------------------------------------------------------------------
+  # 6. SCENE 3 (config button) — panic reset: clears all overrides
+  # ---------------------------------------------------------------------------
+  - id: ZONE_switch_scene3_reset
+    alias: "ROOM_NAME — Switch Scene 3 (Reset All Overrides)"
+    description: >
+      Clears both manual override and dumb mode flags, then turns the light off.
+      Use as a panic reset if the room gets into an unexpected state.
+    mode: single
+    trigger:
+      - platform: device
+        device_id: SWITCH_DEVICE
+        domain: zwave_js
+        type: event.value_notification.central_scene
+        property: scene
+        property_key: "003"
+        endpoint: 0
+        command_class: 91
+        subtype: "Endpoint 0 Scene 003"
+        value: 0
+    action:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.ZONE_automation_disabled
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.ZONE_motion_blocker
+      - action: light.turn_off
+        target:
+          entity_id: LIGHT_ENTITY
+        data:
+          transition: 1
+
+
+  # ---------------------------------------------------------------------------
+  # 7. DIM WINDOW START — transition to dim brightness when window opens
+  # ---------------------------------------------------------------------------
+  - id: ZONE_dim_window_start
+    alias: "ROOM_NAME — Dim Window Start"
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.ZONE_dim_start
+    condition:
+      - condition: state
+        entity_id: LIGHT_ENTITY
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.ZONE_motion_blocker
+        state: "off"
+    action:
+      - action: light.turn_on
+        target:
+          entity_id: LIGHT_ENTITY
+        data:
+          brightness_pct: "{{ states('input_number.ZONE_dim_brightness') | int(10) }}"
+          transition: 5
+
+
+  # ---------------------------------------------------------------------------
+  # 8. DIM WINDOW END — transition to normal brightness when window closes
+  # ---------------------------------------------------------------------------
+  - id: ZONE_dim_window_end
+    alias: "ROOM_NAME — Dim Window End"
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.ZONE_dim_end
+    condition:
+      - condition: state
+        entity_id: LIGHT_ENTITY
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.ZONE_motion_blocker
+        state: "off"
+    action:
+      - action: light.turn_on
+        target:
+          entity_id: LIGHT_ENTITY
+        data:
+          brightness_pct: "{{ states('input_number.ZONE_normal_brightness') | int(100) }}"
+          transition: 5

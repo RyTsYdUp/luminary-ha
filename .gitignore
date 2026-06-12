@@ -1,0 +1,7 @@
+# Generated room-specific packages (output from setup.sh)
+output/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

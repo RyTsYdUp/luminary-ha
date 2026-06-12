@@ -1,0 +1,91 @@
+# =============================================================================
+# HA Zone Motion — Lovelace Dashboard Card
+# =============================================================================
+# Copy this into a dashboard view using the YAML editor.
+# Replace ZONE and ROOM_NAME with your values (same as package.yaml).
+# =============================================================================
+
+type: vertical-stack
+cards:
+
+  # Status header — shows current mode (Automated / Standby / Manual Override / Disabled)
+  - type: entity
+    entity: sensor.ZONE_automation_status
+    name: ROOM_NAME Light Control
+    icon: mdi-motion-sensor
+
+  # Mode override toggles
+  - type: horizontal-stack
+    cards:
+      - type: tile
+        entity: input_boolean.ZONE_motion_blocker
+        name: Manual Mode
+        icon: mdi-hand-back-right
+        color: orange
+      - type: tile
+        entity: input_boolean.ZONE_automation_disabled
+        name: Disabled
+        icon: mdi-robot-off
+        color: red
+
+  # Daytime suppression — selector + conditional config rows
+  - type: entities
+    title: Daytime Suppression
+    entities:
+      - entity: input_select.ZONE_daytime_mode
+        name: Mode
+
+  # Sun elevation config — visible only when Sun Elevation mode is selected
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.ZONE_daytime_mode
+        state: Sun Elevation
+    card:
+      type: entities
+      entities:
+        - entity: input_number.ZONE_sun_elevation_threshold
+          name: "Sun Elevation Threshold (°)"
+          secondary_info: "Activate when sun is below this angle. 0° = exact sunset. Each degree ≈ 4 min."
+
+  # Lux sensor config — visible only when Lux Sensor mode is selected
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.ZONE_daytime_mode
+        state: Lux Sensor
+    card:
+      type: entities
+      entities:
+        - entity: input_number.ZONE_lux_threshold
+          name: "Lux Threshold"
+          secondary_info: "Activate when lux reading is below this value."
+        - entity: input_text.ZONE_lux_sensor_entity
+          name: "Lux Sensor Entity ID"
+          secondary_info: "e.g. sensor.hallway_motion_1_illuminance"
+
+  # Dim window — nightlight time range
+  - type: entities
+    title: Nightlight Window
+    entities:
+      - entity: input_datetime.ZONE_dim_start
+        name: Start
+      - entity: input_datetime.ZONE_dim_end
+        name: End
+
+  # Brightness sliders
+  - type: entities
+    title: Brightness
+    entities:
+      - entity: input_number.ZONE_dim_brightness
+        name: Nightlight Brightness
+      - entity: input_number.ZONE_normal_brightness
+        name: Normal Brightness
+
+  # Safety / timing
+  - type: entities
+    title: Safety Settings
+    entities:
+      - entity: input_number.ZONE_motion_timeout_min
+        name: Stuck Sensor Timeout
+        secondary_info: "Lights turn off after this many minutes if sensors never clear."
