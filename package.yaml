@@ -290,7 +290,7 @@ automation:
 
 
   # ---------------------------------------------------------------------------
-  # 2. SINGLE TAP UP — manual on (full bright + enable override)
+  # 2. SINGLE TAP UP — full bright + override (smart mode) or plain on (dumb mode)
   # ---------------------------------------------------------------------------
   - id: ZONE_switch_single_up
     alias: "ROOM_NAME — Switch Single Tap Up (Manual On)"
@@ -306,24 +306,35 @@ automation:
         command_class: 91
         subtype: "Endpoint 0 Scene 001"
         value: 0
-    condition:
-      - condition: state
-        entity_id: input_boolean.ZONE_automation_disabled
-        state: "off"
     action:
-      - action: light.turn_on
-        target:
-          entity_id: LIGHT_ENTITY
-        data:
-          brightness_pct: 100
-          transition: 1
-      - action: input_boolean.turn_on
-        target:
-          entity_id: input_boolean.ZONE_motion_blocker
+      - choose:
+          # Dumb mode — act as a plain on switch
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.ZONE_automation_disabled
+                state: "on"
+            sequence:
+              - action: light.turn_on
+                target:
+                  entity_id: LIGHT_ENTITY
+                data:
+                  brightness_pct: 100
+                  transition: 1
+        # Smart mode — full bright + enable manual override
+        default:
+          - action: light.turn_on
+            target:
+              entity_id: LIGHT_ENTITY
+            data:
+              brightness_pct: 100
+              transition: 1
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.ZONE_motion_blocker
 
 
   # ---------------------------------------------------------------------------
-  # 3. SINGLE TAP DOWN — release manual override, return to auto brightness
+  # 3. SINGLE TAP DOWN — return to auto (smart mode) or plain off (dumb mode)
   # ---------------------------------------------------------------------------
   - id: ZONE_switch_single_down
     alias: "ROOM_NAME — Switch Single Tap Down (Return to Auto)"
@@ -339,37 +350,45 @@ automation:
         command_class: 91
         subtype: "Endpoint 0 Scene 002"
         value: 0
-    condition:
-      - condition: state
-        entity_id: input_boolean.ZONE_automation_disabled
-        state: "off"
     action:
-      - action: input_boolean.turn_off
-        target:
-          entity_id: input_boolean.ZONE_motion_blocker
-      # If any sensor currently detects motion, set appropriate brightness.
-      # Otherwise turn off and let motion re-trigger.
       - choose:
+          # Dumb mode — act as a plain off switch
           - conditions:
-              - condition: or
-                conditions:
-                  - condition: state
-                    entity_id: SENSOR_1
-                    state: "on"
-                  - condition: state
-                    entity_id: SENSOR_2
-                    state: "on"
-                  - condition: state
-                    entity_id: SENSOR_3
-                    state: "on"
+              - condition: state
+                entity_id: input_boolean.ZONE_automation_disabled
+                state: "on"
             sequence:
-              - action: script.ZONE_set_brightness
+              - action: light.turn_off
+                target:
+                  entity_id: LIGHT_ENTITY
+                data:
+                  transition: 1
+        # Smart mode — release blocker, then check if motion is still active
         default:
-          - action: light.turn_off
+          - action: input_boolean.turn_off
             target:
-              entity_id: LIGHT_ENTITY
-            data:
-              transition: 1
+              entity_id: input_boolean.ZONE_motion_blocker
+          - choose:
+              - conditions:
+                  - condition: or
+                    conditions:
+                      - condition: state
+                        entity_id: SENSOR_1
+                        state: "on"
+                      - condition: state
+                        entity_id: SENSOR_2
+                        state: "on"
+                      - condition: state
+                        entity_id: SENSOR_3
+                        state: "on"
+                sequence:
+                  - action: script.ZONE_set_brightness
+            default:
+              - action: light.turn_off
+                target:
+                  entity_id: LIGHT_ENTITY
+                data:
+                  transition: 1
 
 
   # ---------------------------------------------------------------------------
