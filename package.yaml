@@ -9,7 +9,7 @@
 #   ZONE           → entity prefix,  e.g. "hallway"
 #   SWITCH_DEVICE  → Z-Wave switch device_id from your HA device registry
 #   LIGHT_ENTITY   → entity_id of the light, e.g. "light.hallway_lights"
-#   SENSOR_1/2/3   → entity_ids of the three motion sensors
+#   SENSOR_x       → entity_ids of your motion sensors (see SENSORS section)
 #
 #   Quick rename (Linux/macOS):
 #     sed -i 's/ZONE/hallway/g; s/ROOM_NAME/Hallway/g' package.yaml
@@ -17,6 +17,8 @@
 #   A setup wizard script is provided in scripts/setup.sh
 #
 # REQUIREMENTS: Home Assistant 2024.1+, Z-Wave JS integration
+#               Switch must support Z-Wave Central Scene (command class 91)
+#               for single/double-tap automations to work.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -119,6 +121,28 @@ input_text:
 
 
 # -----------------------------------------------------------------------------
+# SENSORS — Define your motion sensors here.
+#
+#   Edit the two marked locations below to add or remove sensors:
+#     1. The binary_sensor group entity list (this section)
+#     2. The trigger entity_id list in automation ZONE_motion_lights
+#
+#   Both lists must always match exactly.
+#   Minimum: 1 sensor. No maximum.
+# -----------------------------------------------------------------------------
+binary_sensor:
+  - platform: group
+    name: "ROOM_NAME Motion Sensors"
+    unique_id: ZONE_motion_group
+    device_class: motion
+    # [SYNC POINT 1 — edit sensor list here]
+    entities:
+      - SENSOR_1
+      - SENSOR_2   # remove if fewer than 3 sensors
+      - SENSOR_3   # remove if fewer than 3 sensors
+
+
+# -----------------------------------------------------------------------------
 # TEMPLATE SENSOR — status indicator for the dashboard
 # -----------------------------------------------------------------------------
 template:
@@ -168,15 +192,6 @@ script:
     icon: mdi-brightness-auto
     sequence:
       - variables:
-          in_dim_window: >
-            {% set start = states('input_datetime.ZONE_dim_start')[11:16] %}
-            {% set end   = states('input_datetime.ZONE_dim_end')[11:16] %}
-            {% set t     = now().strftime('%H:%M') %}
-            {% if start <= end %}
-              {{ start <= t < end }}
-            {% else %}
-              {{ t >= start or t < end }}
-            {% endif %}
           brightness_pct: >
             {% set start = states('input_datetime.ZONE_dim_start')[11:16] %}
             {% set end   = states('input_datetime.ZONE_dim_end')[11:16] %}
@@ -212,11 +227,12 @@ automation:
     mode: restart
 
     trigger:
+      # [SYNC POINT 2 — edit sensor list here, must match binary_sensor group above]
       - platform: state
         entity_id:
           - SENSOR_1
-          - SENSOR_2
-          - SENSOR_3
+          - SENSOR_2   # remove if fewer than 3 sensors
+          - SENSOR_3   # remove if fewer than 3 sensors
         to: "on"
 
     condition:
@@ -253,24 +269,20 @@ automation:
                   {% endif %}
 
     action:
-      # Turn on at time-appropriate brightness
       - action: script.ZONE_set_brightness
 
-      # Compute timeout from slider before waiting
       - variables:
           motion_timeout: >
             {% set mins = states('input_number.ZONE_motion_timeout_min') | int(2) %}
             {{ '%02d:%02d:00' % (mins // 60, mins % 60) }}
 
-      # Wait for all sensors to clear, or until safety timeout
+      # Wait for the sensor group to clear, or until safety timeout.
       # mode: restart means any new motion trigger resets this entire sequence,
       # which also resets the timeout clock — no extra logic needed.
       - wait_for_trigger:
-          - platform: template
-            value_template: >
-              {{ states('SENSOR_1') == 'off'
-                 and states('SENSOR_2') == 'off'
-                 and states('SENSOR_3') == 'off' }}
+          - platform: state
+            entity_id: binary_sensor.ZONE_motion_sensors
+            to: "off"
         timeout: "{{ motion_timeout }}"
         continue_on_timeout: true
 
@@ -370,17 +382,9 @@ automation:
               entity_id: input_boolean.ZONE_motion_blocker
           - choose:
               - conditions:
-                  - condition: or
-                    conditions:
-                      - condition: state
-                        entity_id: SENSOR_1
-                        state: "on"
-                      - condition: state
-                        entity_id: SENSOR_2
-                        state: "on"
-                      - condition: state
-                        entity_id: SENSOR_3
-                        state: "on"
+                  - condition: state
+                    entity_id: binary_sensor.ZONE_motion_sensors
+                    state: "on"
                 sequence:
                   - action: script.ZONE_set_brightness
             default:
@@ -393,6 +397,7 @@ automation:
 
   # ---------------------------------------------------------------------------
   # 4. DOUBLE TAP UP — enable dumb mode (automation fully disabled)
+  #    Light state is preserved — the switch now acts as plain on/off.
   # ---------------------------------------------------------------------------
   - id: ZONE_switch_double_up
     alias: "ROOM_NAME — Switch Double Tap Up (Disable Automation)"
@@ -415,11 +420,6 @@ automation:
       - action: input_boolean.turn_off
         target:
           entity_id: input_boolean.ZONE_motion_blocker
-      - action: light.turn_off
-        target:
-          entity_id: LIGHT_ENTITY
-        data:
-          transition: 1
 
 
   # ---------------------------------------------------------------------------
@@ -445,17 +445,9 @@ automation:
           entity_id: input_boolean.ZONE_automation_disabled
       - choose:
           - conditions:
-              - condition: or
-                conditions:
-                  - condition: state
-                    entity_id: SENSOR_1
-                    state: "on"
-                  - condition: state
-                    entity_id: SENSOR_2
-                    state: "on"
-                  - condition: state
-                    entity_id: SENSOR_3
-                    state: "on"
+              - condition: state
+                entity_id: binary_sensor.ZONE_motion_sensors
+                state: "on"
             sequence:
               - action: script.ZONE_set_brightness
         default:
@@ -554,3 +546,33 @@ automation:
         data:
           brightness_pct: "{{ states('input_number.ZONE_normal_brightness') | int(100) }}"
           transition: 5
+
+
+  # ---------------------------------------------------------------------------
+  # 9. DIM SETTING CHANGED — re-evaluate brightness immediately when the user
+  #    saves a new dim window time, correcting any missed boundary on the spot.
+  # ---------------------------------------------------------------------------
+  - id: ZONE_dim_setting_changed
+    alias: "ROOM_NAME — Dim Setting Changed"
+    description: >
+      Fires whenever the dim window start or end time is saved. If the light is
+      on and not in a manual or dumb-mode state, immediately re-applies the
+      correct brightness for the current time under the new window settings.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - input_datetime.ZONE_dim_start
+          - input_datetime.ZONE_dim_end
+    condition:
+      - condition: state
+        entity_id: LIGHT_ENTITY
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.ZONE_motion_blocker
+        state: "off"
+    action:
+      - action: script.ZONE_set_brightness
