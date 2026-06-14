@@ -1,0 +1,121 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Luminary zone",
+        "description": "Select the area this zone covers. Create the area first in Settings → Areas if it doesn't exist yet.",
+        "data": {
+          "area_id": "Area",
+          "sensors": "Motion sensors",
+          "light": "Light",
+          "switch_device": "Z-Wave switch (optional)"
+        },
+        "data_description": {
+          "area_id": "The room or zone this automation covers",
+          "sensors": "One or more motion sensors that cover this zone",
+          "light": "The light entity to control",
+          "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "A Luminary zone is already configured for this area."
+    },
+    "error": {
+      "area_not_found": "Selected area no longer exists.",
+      "no_sensors": "At least one motion sensor is required."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Luminary zone",
+        "description": "Update the devices associated with this zone. The area cannot be changed — delete and re-add the zone to move it.",
+        "data": {
+          "sensors": "Motion sensors",
+          "light": "Light",
+          "switch_device": "Z-Wave switch (optional)"
+        },
+        "data_description": {
+          "sensors": "One or more motion sensors that cover this zone",
+          "light": "The light entity to control",
+          "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
+        }
+      }
+    },
+    "error": {
+      "no_sensors": "At least one motion sensor is required."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "motion_group": {
+        "name": "Motion"
+      }
+    },
+    "number": {
+      "light_on_time_sec": {
+        "name": "Light On Time"
+      },
+      "sun_elevation_threshold": {
+        "name": "Sun Elevation Threshold"
+      },
+      "lux_threshold": {
+        "name": "Lux Threshold"
+      },
+      "dim_brightness": {
+        "name": "Nightlight Brightness"
+      },
+      "normal_brightness": {
+        "name": "Normal Brightness"
+      }
+    },
+    "select": {
+      "daytime_mode": {
+        "name": "Daytime Mode",
+        "state": {
+          "Sun Elevation": "Sun Elevation",
+          "Lux Sensor": "Lux Sensor"
+        }
+      }
+    },
+    "sensor": {
+      "automation_status": {
+        "name": "Automation Status",
+        "state": {
+          "Automated": "Automated",
+          "Standby": "Standby",
+          "Manual Override": "Manual Override",
+          "Disabled": "Disabled"
+        }
+      }
+    },
+    "switch": {
+      "daytime_detection_enabled": {
+        "name": "Daytime Detection"
+      },
+      "nightlight_enabled": {
+        "name": "Nightlight"
+      },
+      "motion_blocker": {
+        "name": "Manual Override"
+      },
+      "automation_disabled": {
+        "name": "Automation Disabled"
+      }
+    },
+    "text": {
+      "lux_sensor_entity": {
+        "name": "Lux Sensor Entity"
+      }
+    },
+    "time": {
+      "dim_start": {
+        "name": "Nightlight Window Start"
+      },
+      "dim_end": {
+        "name": "Nightlight Window End"
+      }
+    }
+  }
+}

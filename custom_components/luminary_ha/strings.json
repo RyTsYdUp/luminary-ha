@@ -1,0 +1,50 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Luminary zone",
+        "description": "Select the area this zone covers. Create the area first in Settings → Areas if it doesn't exist yet.",
+        "data": {
+          "area_id": "Area",
+          "sensors": "Motion sensors",
+          "light": "Light",
+          "switch_device": "Z-Wave switch (optional)"
+        },
+        "data_description": {
+          "area_id": "The room or zone this automation covers",
+          "sensors": "One or more motion sensors that cover this zone",
+          "light": "The light entity to control",
+          "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "A Luminary zone is already configured for this area."
+    },
+    "error": {
+      "area_not_found": "Selected area no longer exists.",
+      "no_sensors": "At least one motion sensor is required."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Luminary zone",
+        "description": "Update the devices associated with this zone. The area cannot be changed — delete and re-add the zone to move it.",
+        "data": {
+          "sensors": "Motion sensors",
+          "light": "Light",
+          "switch_device": "Z-Wave switch (optional)"
+        },
+        "data_description": {
+          "sensors": "One or more motion sensors that cover this zone",
+          "light": "The light entity to control",
+          "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
+        }
+      }
+    },
+    "error": {
+      "no_sensors": "At least one motion sensor is required."
+    }
+  }
+}

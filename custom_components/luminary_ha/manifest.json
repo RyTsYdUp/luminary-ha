@@ -1,0 +1,13 @@
+{
+  "domain": "luminary_ha",
+  "name": "Luminary HA",
+  "version": "0.1.0",
+  "documentation": "https://forgejo.paqnet.net/Thomas/luminary-ha",
+  "issue_tracker": "https://forgejo.paqnet.net/Thomas/luminary-ha/issues",
+  "codeowners": ["@Thomas"],
+  "requirements": [],
+  "dependencies": [],
+  "after_dependencies": ["zwave_js"],
+  "iot_class": "local_push",
+  "config_flow": true
+}

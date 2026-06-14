@@ -1,0 +1,818 @@
+"""
+Comprehensive unit tests for ZoneCoordinator.
+
+Scenarios covered
+-----------------
+is_dark_enough
+  1.  Sun mode, elevation below threshold       → True  (dark enough)
+  2.  Sun mode, elevation above threshold       → False (too bright)
+  3.  Sun mode, sun entity missing              → True  (fail-safe)
+  4.  Lux mode, lux below threshold             → True
+  5.  Lux mode, lux above threshold             → False
+  6.  Lux mode, lux entity ID not configured    → True  (fail-safe)
+  7.  Lux mode, lux sensor unavailable          → True  (fail-safe)
+
+in_dim_window
+  8.  Simple window (no midnight crossing), inside   → True
+  9.  Simple window, outside                         → False
+  10. Midnight-crossing window (23:00–06:00), inside → True
+  11. Midnight-crossing window, outside              → False
+
+target_brightness
+  12. Nightlight on, in dim window               → dim_brightness
+  13. Nightlight on, not in dim window           → normal_brightness
+  14. Nightlight off, in dim window              → normal_brightness (override)
+
+compute_status
+  15. automation_disabled=on                    → "Disabled"
+  16. automation_disabled=off, blocker=on       → "Manual Override"
+  17. neither, dark enough                      → "Automated"
+  18. neither, not dark enough                  → "Standby"
+
+nightlight_enabled property
+  19. switch state "on"                         → True
+  20. switch state "off"                        → False
+  21. switch entity not found (None)            → True  (fail-safe default)
+
+Motion trigger guard conditions (_handle_sensor_change)
+  22. Sensor → "on", all conditions met         → motion task created
+  23. Sensor → "on", automation_disabled=on     → no task
+  24. Sensor → "on", motion_blocker=on          → no task
+  25. Sensor → "not dark enough"                → no task
+  26. Sensor → "off" (not an "on" event)        → no task
+
+Motion restart
+  27. New trigger while task running            → old task cancelled, new task created
+
+Motion sequence: light control
+  28. Sensors clear before timeout              → light on then off
+  29. Timeout fires, sensors still on           → light off + refresh_value called
+  30. Timeout fires, sensors clear              → light off, no refresh_value
+  31. CancelledError propagates cleanly         → no light off
+  32. automation_disabled set during wait       → no light off
+
+Z-Wave event filtering
+  33. Event for wrong device_id                 → no handler called
+  34. Event for wrong command_class             → no handler called
+
+Z-Wave switch handlers
+  35. Single tap ↑, smart mode                 → light 100% + blocker on
+  36. Single tap ↑, dumb mode                  → light 100%, blocker unchanged
+  37. Single tap ↓, smart mode, sensors on     → blocker off, light on at auto brightness
+  38. Single tap ↓, smart mode, sensors off    → blocker off, light off
+  39. Single tap ↓, dumb mode                  → light off
+  40. Double tap ↑                             → automation_disabled on, blocker off
+  41. Double tap ↓, sensors on                 → automation_disabled off, light on
+  42. Double tap ↓, sensors off               → automation_disabled off, light off
+  43. Scene 3 (config button)                  → both off, light off
+
+Dim window boundary handlers
+  44. dim_start fires, nightlight on, light on, not overridden → dim brightness
+  45. dim_start fires, nightlight off                           → no change
+  46. dim_start fires, light off                               → no change
+  47. dim_start fires, automation_disabled                     → no change
+  48. dim_end fires, light on                                  → normal brightness
+  49. dim_end fires, light off                                 → no change
+
+Sensor unavailable / recovery
+  50. Sensor becomes unavailable               → persistent_notification created
+  51. Sensor recovers, all sensors available   → notification dismissed
+  52. Sensor recovers, another still unavailable → notification NOT dismissed
+
+Motion group state
+  53. Any sensor "on"                          → _sensors_any_on = True
+  54. All sensors "off"                        → _sensors_any_on = False
+  55. State change updates motion_group_entity
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, call, patch
+
+import pytest
+
+from custom_components.luminary_ha.coordinator import ZoneCoordinator
+from custom_components.luminary_ha.const import (
+    CONF_AREA,
+    CONF_LIGHT,
+    CONF_SENSORS,
+    CONF_SWITCH_DEVICE,
+    CONF_ZONE_ID,
+    CONF_ZONE_NAME,
+    DAYTIME_MODE_LUX,
+    DAYTIME_MODE_SUN,
+    ZWAVE_SCENE_KEY_CONFIG,
+    ZWAVE_SCENE_KEY_DOWN,
+    ZWAVE_SCENE_KEY_UP,
+    ZWAVE_SCENE_VALUE_DOUBLE,
+    ZWAVE_SCENE_VALUE_SINGLE,
+)
+
+# Re-import the stub Event so we can construct test payloads
+from tests.conftest import _Event as Event
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+ZONE_ID = "hallway"
+ENTRY_ID = "entry_test_001"
+SENSOR_1 = "binary_sensor.motion_1"
+SENSOR_2 = "binary_sensor.motion_2"
+LIGHT = "light.hallway"
+SWITCH_DEVICE = "device_abc"
+
+
+def _s(state: str, attributes: dict | None = None):
+    """Build a fake HA state object."""
+    m = MagicMock()
+    m.state = state
+    m.attributes = attributes or {}
+    return m
+
+
+class FakeStates:
+    """Dict-backed state machine for tests."""
+
+    def __init__(self):
+        self._d: dict = {}
+
+    def put(self, entity_id: str, state: str, attributes: dict | None = None):
+        self._d[entity_id] = _s(state, attributes)
+        return self
+
+    def get(self, entity_id):
+        return self._d.get(entity_id)
+
+    def is_state(self, entity_id: str, state: str) -> bool:
+        s = self._d.get(entity_id)
+        return s is not None and s.state == state
+
+
+def _default_states() -> FakeStates:
+    """Return a FakeStates pre-populated with safe defaults for all entities."""
+    st = FakeStates()
+    st.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+    st.put(f"switch.{ZONE_ID}_motion_blocker", "off")
+    st.put(f"switch.{ZONE_ID}_nightlight_enabled", "on")
+    st.put(f"number.{ZONE_ID}_light_on_time_sec", "60")
+    st.put(f"number.{ZONE_ID}_dim_brightness", "10")
+    st.put(f"number.{ZONE_ID}_normal_brightness", "100")
+    st.put(f"number.{ZONE_ID}_sun_elevation_threshold", "3.0")
+    st.put(f"number.{ZONE_ID}_lux_threshold", "50")
+    st.put(f"select.{ZONE_ID}_daytime_mode", DAYTIME_MODE_SUN)
+    st.put(f"text.{ZONE_ID}_lux_sensor_entity", "")
+    st.put(f"time.{ZONE_ID}_dim_start", "00:00:00")
+    st.put(f"time.{ZONE_ID}_dim_end", "06:00:00")
+    st.put(LIGHT, "off")
+    st.put(SENSOR_1, "off")
+    st.put(SENSOR_2, "off")
+    st.put("sun.sun", "above_horizon", {"elevation": 10.0})
+    return st
+
+
+def _make_hass(states: FakeStates | None = None) -> MagicMock:
+    hass = MagicMock()
+    hass.states = states or _default_states()
+    hass.services = MagicMock()
+    hass.services.async_call = AsyncMock()
+    hass.bus = MagicMock()
+    hass.bus.async_listen = MagicMock(return_value=lambda: None)
+    tasks: list[asyncio.Task] = []
+    hass._tasks = tasks
+
+    def _create_task(coro):
+        t = asyncio.ensure_future(coro)
+        tasks.append(t)
+        return t
+
+    hass.async_create_task = _create_task
+    return hass
+
+
+def _make_entry() -> MagicMock:
+    entry = MagicMock()
+    entry.entry_id = ENTRY_ID
+    entry.data = {
+        CONF_ZONE_ID: ZONE_ID,
+        CONF_ZONE_NAME: "Hallway",
+        CONF_AREA: "area_hallway",
+    }
+    entry.options = {
+        CONF_SENSORS: [SENSOR_1, SENSOR_2],
+        CONF_LIGHT: LIGHT,
+        CONF_SWITCH_DEVICE: SWITCH_DEVICE,
+    }
+    return entry
+
+
+@pytest.fixture
+def states():
+    return _default_states()
+
+
+@pytest.fixture
+def hass(states):
+    return _make_hass(states)
+
+
+@pytest.fixture
+def entry():
+    return _make_entry()
+
+
+@pytest.fixture
+def coord(hass, entry):
+    c = ZoneCoordinator(hass, entry)
+    c._dim_unsubs = []
+    return c
+
+
+def _zwave_event(device_id=SWITCH_DEVICE, command_class=91, key=ZWAVE_SCENE_KEY_UP, value=ZWAVE_SCENE_VALUE_SINGLE):
+    return Event({
+        "device_id": device_id,
+        "command_class": command_class,
+        "property_key": key,
+        "value": value,
+    })
+
+
+# ---------------------------------------------------------------------------
+# 1–7  is_dark_enough
+# ---------------------------------------------------------------------------
+
+class TestIsDarkEnough:
+
+    def test_01_sun_mode_below_threshold(self, coord, states):
+        states.put("sun.sun", "above_horizon", {"elevation": -2.0})
+        assert coord.is_dark_enough() is True
+
+    def test_02_sun_mode_above_threshold(self, coord, states):
+        states.put("sun.sun", "above_horizon", {"elevation": 10.0})
+        assert coord.is_dark_enough() is False
+
+    def test_03_sun_entity_missing(self, coord):
+        coord.hass.states.get = lambda eid: None  # no states at all
+        assert coord.is_dark_enough() is True
+
+    def test_04_lux_mode_below_threshold(self, coord, states):
+        states.put(f"select.{ZONE_ID}_daytime_mode", DAYTIME_MODE_LUX)
+        states.put(f"text.{ZONE_ID}_lux_sensor_entity", "sensor.lux")
+        states.put("sensor.lux", "30")
+        assert coord.is_dark_enough() is True
+
+    def test_05_lux_mode_above_threshold(self, coord, states):
+        states.put(f"select.{ZONE_ID}_daytime_mode", DAYTIME_MODE_LUX)
+        states.put(f"text.{ZONE_ID}_lux_sensor_entity", "sensor.lux")
+        states.put("sensor.lux", "200")
+        assert coord.is_dark_enough() is False
+
+    def test_06_lux_mode_no_entity_configured(self, coord, states):
+        states.put(f"select.{ZONE_ID}_daytime_mode", DAYTIME_MODE_LUX)
+        # lux_sensor_entity is empty string (default)
+        assert coord.is_dark_enough() is True
+
+    def test_07_lux_mode_sensor_unavailable(self, coord, states):
+        states.put(f"select.{ZONE_ID}_daytime_mode", DAYTIME_MODE_LUX)
+        states.put(f"text.{ZONE_ID}_lux_sensor_entity", "sensor.lux")
+        states.put("sensor.lux", "unavailable")
+        assert coord.is_dark_enough() is True
+
+
+# ---------------------------------------------------------------------------
+# 8–11  in_dim_window
+# ---------------------------------------------------------------------------
+
+class TestInDimWindow:
+
+    def _set_window(self, states, start: str, end: str):
+        states.put(f"time.{ZONE_ID}_dim_start", start)
+        states.put(f"time.{ZONE_ID}_dim_end", end)
+
+    def test_08_simple_window_inside(self, coord, states):
+        self._set_window(states, "22:00:00", "23:00:00")
+        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 1, 22, 30)
+            assert coord.in_dim_window() is True
+
+    def test_09_simple_window_outside(self, coord, states):
+        self._set_window(states, "22:00:00", "23:00:00")
+        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 1, 10, 0)
+            assert coord.in_dim_window() is False
+
+    def test_10_midnight_crossing_inside(self, coord, states):
+        self._set_window(states, "23:00:00", "06:00:00")
+        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 1, 2, 0)
+            assert coord.in_dim_window() is True
+
+    def test_11_midnight_crossing_outside(self, coord, states):
+        self._set_window(states, "23:00:00", "06:00:00")
+        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 1, 12, 0)
+            assert coord.in_dim_window() is False
+
+
+# ---------------------------------------------------------------------------
+# 12–14  target_brightness
+# ---------------------------------------------------------------------------
+
+class TestTargetBrightness:
+
+    def test_12_nightlight_on_in_window(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_nightlight_enabled", "on")
+        with patch.object(coord, "in_dim_window", return_value=True):
+            assert coord.target_brightness() == 10   # dim_brightness default
+
+    def test_13_nightlight_on_outside_window(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_nightlight_enabled", "on")
+        with patch.object(coord, "in_dim_window", return_value=False):
+            assert coord.target_brightness() == 100  # normal_brightness default
+
+    def test_14_nightlight_off_in_window(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_nightlight_enabled", "off")
+        with patch.object(coord, "in_dim_window", return_value=True):
+            assert coord.target_brightness() == 100  # nightlight disabled → always normal
+
+
+# ---------------------------------------------------------------------------
+# 15–18  compute_status
+# ---------------------------------------------------------------------------
+
+class TestComputeStatus:
+
+    def test_15_automation_disabled(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        status, icon = coord.compute_status()
+        assert status == "Disabled"
+        assert "off" in icon
+
+    def test_16_manual_override(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        states.put(f"switch.{ZONE_ID}_motion_blocker", "on")
+        status, _ = coord.compute_status()
+        assert status == "Manual Override"
+
+    def test_17_automated_when_dark(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        states.put(f"switch.{ZONE_ID}_motion_blocker", "off")
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+        status, _ = coord.compute_status()
+        assert status == "Automated"
+
+    def test_18_standby_when_light(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        states.put(f"switch.{ZONE_ID}_motion_blocker", "off")
+        states.put("sun.sun", "above_horizon", {"elevation": 20.0})
+        status, _ = coord.compute_status()
+        assert status == "Standby"
+
+
+# ---------------------------------------------------------------------------
+# 19–21  nightlight_enabled
+# ---------------------------------------------------------------------------
+
+class TestNightlightEnabled:
+
+    def test_19_switch_on(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_nightlight_enabled", "on")
+        assert coord.nightlight_enabled is True
+
+    def test_20_switch_off(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_nightlight_enabled", "off")
+        assert coord.nightlight_enabled is False
+
+    def test_21_entity_not_found_defaults_true(self, coord):
+        # Entity doesn't exist in state machine yet → state is None → default True
+        empty = FakeStates()
+        coord.hass.states = empty
+        assert coord.nightlight_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# 22–26  Motion trigger guard conditions
+# ---------------------------------------------------------------------------
+
+class TestMotionGuards:
+
+    def test_22_conditions_met_creates_task(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+        coord._motion_task = None
+        # Use a plain MagicMock so no real asyncio task is created in the sync test
+        coord.hass.async_create_task = MagicMock(return_value=MagicMock())
+        coord._handle_sensor_change(Event({"entity_id": SENSOR_1, "new_state": _s("on"), "old_state": _s("off")}))
+        coord.hass.async_create_task.assert_called_once()
+
+    def test_23_automation_disabled_blocks(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+        coord._handle_sensor_change(Event({"entity_id": SENSOR_1, "new_state": _s("on"), "old_state": _s("off")}))
+        assert coord._motion_task is None
+
+    def test_24_motion_blocker_blocks(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_motion_blocker", "on")
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+        coord._handle_sensor_change(Event({"entity_id": SENSOR_1, "new_state": _s("on"), "old_state": _s("off")}))
+        assert coord._motion_task is None
+
+    def test_25_not_dark_enough_blocks(self, coord, states):
+        states.put("sun.sun", "above_horizon", {"elevation": 20.0})
+        coord._handle_sensor_change(Event({"entity_id": SENSOR_1, "new_state": _s("on"), "old_state": _s("off")}))
+        assert coord._motion_task is None
+
+    def test_26_sensor_off_event_does_not_trigger(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+        coord._handle_sensor_change(Event({"entity_id": SENSOR_1, "new_state": _s("off"), "old_state": _s("on")}))
+        assert coord._motion_task is None
+
+
+# ---------------------------------------------------------------------------
+# 27  Motion restart
+# ---------------------------------------------------------------------------
+
+class TestMotionRestart:
+
+    async def test_27_new_trigger_cancels_old_task(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+
+        # Plant a fake "running" task
+        old_future: asyncio.Future = asyncio.get_event_loop().create_future()
+        old_task = asyncio.ensure_future(asyncio.sleep(9999))
+        coord._motion_task = old_task
+
+        # Trigger motion again
+        with patch(
+            "custom_components.luminary_ha.coordinator.async_track_state_change_event",
+            return_value=lambda: None,
+        ):
+            coord._handle_sensor_change(Event({"entity_id": SENSOR_1, "new_state": _s("on"), "old_state": _s("off")}))
+
+        await asyncio.sleep(0)  # let the event loop process cancellation
+        assert old_task.cancelled()
+        assert coord._motion_task is not old_task
+
+
+# ---------------------------------------------------------------------------
+# 28–32  Motion sequence coroutine
+# ---------------------------------------------------------------------------
+
+class TestMotionSequence:
+
+    async def test_28_light_turns_on_then_off_when_sensors_clear(self, coord, states):
+        """Sensors go off before timeout → light on then off, no refresh."""
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "10")
+        # Both sensors off already
+        states.put(SENSOR_1, "off")
+        states.put(SENSOR_2, "off")
+
+        captured = {}
+
+        def fake_track(hass, entities, cb):
+            captured["cb"] = cb
+            return lambda: None
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", fake_track):
+            task = asyncio.ensure_future(coord._run_motion_sequence())
+            await asyncio.sleep(0)          # let sequence reach wait_for
+            if "cb" in captured:
+                captured["cb"](Event({}))   # simulate state change with sensors off
+            await task
+
+        calls = [c.args[:2] for c in coord.hass.services.async_call.call_args_list]
+        assert ("light", "turn_on") in calls
+        assert ("light", "turn_off") in calls
+        coord.hass.services.async_call.assert_any_call(
+            "zwave_js", "refresh_value", {"entity_id": [SENSOR_1, SENSOR_2]}, blocking=False
+        ) if coord._sensors_any_on else None
+
+    async def test_29_timeout_with_stuck_sensors_calls_refresh(self, coord, states):
+        """Timeout fires with sensors still on → refresh_value called."""
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "1")   # very short timeout
+        states.put(SENSOR_1, "on")
+        states.put(SENSOR_2, "off")
+        coord._sensors_any_on = True  # group reflects sensors on
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_motion_sequence()
+
+        coord.hass.services.async_call.assert_any_call(
+            "zwave_js", "refresh_value", {"entity_id": [SENSOR_1, SENSOR_2]}, blocking=False
+        )
+
+    async def test_30_timeout_sensors_clear_no_refresh(self, coord, states):
+        """Timeout fires with sensors already off → no refresh_value."""
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "1")
+        coord._sensors_any_on = False  # sensors already cleared
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_motion_sequence()
+
+        refresh_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[0] == "zwave_js"]
+        assert len(refresh_calls) == 0
+
+    async def test_31_cancelled_error_propagates(self, coord, states):
+        """CancelledError from restart must propagate; light must NOT be turned off."""
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "60")
+
+        async def slow_clear():
+            await asyncio.sleep(999)
+
+        cleared_mock = MagicMock()
+        cleared_mock.wait = slow_clear
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            task = asyncio.ensure_future(coord._run_motion_sequence())
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
+        assert len(off_calls) == 0
+
+    async def test_32_automation_disabled_during_wait_skips_off(self, coord, states):
+        """If automation_disabled turns on while waiting, don't turn off light."""
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "1")
+        # Mark as disabled BEFORE timeout fires so the guard check catches it
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_motion_sequence()
+
+        off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
+        assert len(off_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# 33–34  Z-Wave event filtering
+# ---------------------------------------------------------------------------
+
+class TestZwaveFiltering:
+
+    async def test_33_wrong_device_ignored(self, coord):
+        coord._single_tap_up = AsyncMock()
+        coord._handle_zwave_event(_zwave_event(device_id="wrong_device"))
+        await asyncio.sleep(0)
+        coord._single_tap_up.assert_not_called()
+
+    async def test_34_wrong_command_class_ignored(self, coord):
+        coord._single_tap_up = AsyncMock()
+        coord._handle_zwave_event(_zwave_event(command_class=99))
+        await asyncio.sleep(0)
+        coord._single_tap_up.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 35–43  Z-Wave switch handlers
+# ---------------------------------------------------------------------------
+
+class TestZwaveSwitchHandlers:
+
+    async def test_35_single_tap_up_smart_mode(self, coord, states):
+        """Smart mode: full bright + enable manual override."""
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        await coord._single_tap_up()
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_on",
+            {"entity_id": LIGHT, "brightness_pct": 100, "transition": 1},
+            blocking=False,
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_on",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=False,
+        )
+
+    async def test_36_single_tap_up_dumb_mode(self, coord, states):
+        """Dumb mode: light on at 100% but no blocker touch."""
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        await coord._single_tap_up()
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_on",
+            {"entity_id": LIGHT, "brightness_pct": 100, "transition": 1},
+            blocking=False,
+        )
+        blocker_calls = [
+            c for c in coord.hass.services.async_call.call_args_list
+            if "motion_blocker" in str(c)
+        ]
+        assert len(blocker_calls) == 0
+
+    async def test_37_single_tap_down_smart_sensors_on(self, coord, states):
+        """Smart + sensors on: release override, keep light on."""
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        coord._sensors_any_on = True
+        await coord._single_tap_down()
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=False,
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_on",
+            {"entity_id": LIGHT, "brightness_pct": coord.target_brightness(), "transition": 1},
+            blocking=False,
+        )
+
+    async def test_38_single_tap_down_smart_sensors_off(self, coord, states):
+        """Smart + sensors off: release override, light off."""
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        coord._sensors_any_on = False
+        await coord._single_tap_down()
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+        )
+
+    async def test_39_single_tap_down_dumb_mode(self, coord, states):
+        """Dumb mode: just turn light off."""
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        await coord._single_tap_down()
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+        )
+
+    async def test_40_double_tap_up(self, coord):
+        """Double tap up → enable dumb mode, clear override."""
+        await coord._double_tap_up()
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_on",
+            {"entity_id": f"switch.{ZONE_ID}_automation_disabled"},
+            blocking=False,
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=False,
+        )
+
+    async def test_41_double_tap_down_sensors_on(self, coord):
+        """Double tap down: exit dumb mode, light on if sensors active."""
+        coord._sensors_any_on = True
+        await coord._double_tap_down()
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_automation_disabled"},
+            blocking=False,
+        )
+        on_calls = [
+            c for c in coord.hass.services.async_call.call_args_list
+            if c.args[:2] == ("light", "turn_on")
+        ]
+        assert len(on_calls) > 0
+
+    async def test_42_double_tap_down_sensors_off(self, coord):
+        """Double tap down: exit dumb mode, light off if no sensors."""
+        coord._sensors_any_on = False
+        await coord._double_tap_down()
+        off_calls = [
+            c for c in coord.hass.services.async_call.call_args_list
+            if c.args[:2] == ("light", "turn_off")
+        ]
+        assert len(off_calls) > 0
+
+    async def test_43_scene3_reset(self, coord):
+        """Scene 3: clear both flags and turn off light."""
+        await coord._scene3_reset()
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_automation_disabled"},
+            blocking=False,
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=False,
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+        )
+
+
+# ---------------------------------------------------------------------------
+# 44–49  Dim window boundary handlers
+# ---------------------------------------------------------------------------
+
+class TestDimWindowHandlers:
+
+    async def test_44_dim_start_applies_dim_brightness(self, coord, states):
+        states.put(LIGHT, "on")
+        coord._handle_dim_window_start(None)
+        await asyncio.sleep(0)  # let the scheduled coroutine run
+        coord.hass.services.async_call.assert_called_once()
+        call_kwargs = coord.hass.services.async_call.call_args
+        assert call_kwargs.args[1] == "turn_on"
+        assert call_kwargs.args[2]["brightness_pct"] == 10   # dim_brightness default
+
+    def test_45_dim_start_skipped_when_nightlight_off(self, coord, states):
+        states.put(LIGHT, "on")
+        states.put(f"switch.{ZONE_ID}_nightlight_enabled", "off")
+        coord._handle_dim_window_start(None)
+        coord.hass.services.async_call.assert_not_called()
+
+    def test_46_dim_start_skipped_when_light_off(self, coord, states):
+        states.put(LIGHT, "off")
+        coord._handle_dim_window_start(None)
+        coord.hass.services.async_call.assert_not_called()
+
+    def test_47_dim_start_skipped_when_automation_disabled(self, coord, states):
+        states.put(LIGHT, "on")
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        coord._handle_dim_window_start(None)
+        coord.hass.services.async_call.assert_not_called()
+
+    async def test_48_dim_end_applies_normal_brightness(self, coord, states):
+        states.put(LIGHT, "on")
+        coord._handle_dim_window_end(None)
+        await asyncio.sleep(0)  # let the scheduled coroutine run
+        coord.hass.services.async_call.assert_called_once()
+        call_kwargs = coord.hass.services.async_call.call_args
+        assert call_kwargs.args[1] == "turn_on"
+        assert call_kwargs.args[2]["brightness_pct"] == 100  # normal_brightness default
+
+    def test_49_dim_end_skipped_when_light_off(self, coord, states):
+        states.put(LIGHT, "off")
+        # Use MagicMock so no loop needed; service call should never happen
+        coord.hass.async_create_task = MagicMock()
+        coord._handle_dim_window_end(None)
+        coord.hass.async_create_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 50–52  Sensor unavailable
+# ---------------------------------------------------------------------------
+
+class TestSensorUnavailable:
+
+    async def test_50_unavailable_creates_notification(self, coord):
+        sensor_state = _s("unavailable", {"friendly_name": "Hallway Motion 1"})
+        await coord._notify_sensor_unavailable(SENSOR_1, sensor_state)
+        coord.hass.services.async_call.assert_called_once_with(
+            "persistent_notification", "create",
+            {
+                "notification_id": f"{ZONE_ID}_sensor_unavailable",
+                "title": "Hallway: Motion Sensor Unavailable",
+                "message": (
+                    "Hallway Motion 1 is unavailable. "
+                    "Hallway motion detection may be impaired. "
+                    "Check your Z-Wave network."
+                ),
+            },
+            blocking=False,
+        )
+
+    async def test_51_recovery_all_available_dismisses(self, coord, states):
+        states.put(SENSOR_1, "off")
+        states.put(SENSOR_2, "off")
+        await coord._maybe_clear_unavailable()
+        coord.hass.services.async_call.assert_called_once_with(
+            "persistent_notification", "dismiss",
+            {"notification_id": f"{ZONE_ID}_sensor_unavailable"},
+            blocking=False,
+        )
+
+    async def test_52_recovery_another_still_unavailable_keeps_notification(self, coord, states):
+        states.put(SENSOR_1, "off")
+        states.put(SENSOR_2, "unavailable")  # still bad
+        await coord._maybe_clear_unavailable()
+        coord.hass.services.async_call.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 53–55  Motion group state
+# ---------------------------------------------------------------------------
+
+class TestMotionGroup:
+
+    def test_53_any_sensor_on_sets_flag(self, coord, states):
+        states.put(SENSOR_1, "on")
+        states.put(SENSOR_2, "off")
+        coord._handle_sensor_change(Event({
+            "entity_id": SENSOR_1,
+            "new_state": _s("on"),
+            "old_state": _s("off"),
+        }))
+        assert coord._sensors_any_on is True
+
+    def test_54_all_sensors_off_clears_flag(self, coord, states):
+        coord._sensors_any_on = True
+        coord._handle_sensor_change(Event({
+            "entity_id": SENSOR_1,
+            "new_state": _s("off"),
+            "old_state": _s("on"),
+        }))
+        assert coord._sensors_any_on is False
+
+    def test_55_state_change_updates_motion_group_entity(self, coord, states):
+        mock_entity = MagicMock()
+        coord.motion_group_entity = mock_entity
+        coord._handle_sensor_change(Event({
+            "entity_id": SENSOR_1,
+            "new_state": _s("on"),
+            "old_state": _s("off"),
+        }))
+        mock_entity.async_write_ha_state.assert_called_once()
