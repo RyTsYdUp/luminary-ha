@@ -1,50 +1,75 @@
 # =============================================================================
-# HA Zone Motion — Lovelace Dashboard Card
+# Luminary HA — Lovelace Dashboard Card
 # =============================================================================
 # Copy this into a dashboard view using the YAML editor.
-# Replace ZONE and ROOM_NAME with your values (same as package.yaml).
+# Replace every ZONE with your zone_id (e.g. hallway) and
+# ROOM_NAME with the display name (e.g. Hallway).
 # =============================================================================
 
 type: vertical-stack
 cards:
 
-  # Status header — shows current mode (Automated / Standby / Manual Override / Disabled)
+  # Status header — Automated / Standby / Manual Override / Disabled
   - type: entity
     entity: sensor.ZONE_automation_status
     name: ROOM_NAME Light Control
-    icon: mdi-motion-sensor
+    icon: mdi:motion-sensor
 
-  # Mode override toggles
+  # Live motion state
+  - type: entity
+    entity: binary_sensor.ZONE_motion_group
+    name: Motion Active
+    icon: mdi:motion-sensor
+
+  # Override toggles (always visible)
   - type: horizontal-stack
     cards:
       - type: tile
-        entity: input_boolean.ZONE_motion_blocker
-        name: Manual Mode
-        icon: mdi-hand-back-right
+        entity: switch.ZONE_motion_blocker
+        name: Manual Override
+        icon: mdi:hand-back-right
         color: orange
       - type: tile
-        entity: input_boolean.ZONE_automation_disabled
+        entity: switch.ZONE_automation_disabled
         name: Disabled
-        icon: mdi-robot-off
+        icon: mdi:robot-off
         color: red
 
-  # Daytime suppression — selector + conditional config rows
+  # Feature toggles
   - type: entities
-    title: Daytime Suppression
+    title: Features
     entities:
-      - entity: input_select.ZONE_daytime_mode
-        name: Mode
+      - entity: switch.ZONE_daytime_detection_enabled
+        name: Daytime Suppression
+      - entity: switch.ZONE_nightlight_enabled
+        name: Nightlight
+
+  # Daytime suppression — mode selector; greys out when suppression is off
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: switch.ZONE_daytime_detection_enabled
+        state: "on"
+    card:
+      type: entities
+      title: Daytime Suppression
+      entities:
+        - entity: select.ZONE_daytime_mode
+          name: Mode
 
   # Sun elevation config — visible only when Sun Elevation mode is selected
   - type: conditional
     conditions:
       - condition: state
-        entity: input_select.ZONE_daytime_mode
+        entity: switch.ZONE_daytime_detection_enabled
+        state: "on"
+      - condition: state
+        entity: select.ZONE_daytime_mode
         state: Sun Elevation
     card:
       type: entities
       entities:
-        - entity: input_number.ZONE_sun_elevation_threshold
+        - entity: number.ZONE_sun_elevation_threshold
           name: "Sun Elevation Threshold (°)"
           secondary_info: "Activate when sun is below this angle. 0° = exact sunset. Each degree ≈ 4 min."
 
@@ -52,40 +77,44 @@ cards:
   - type: conditional
     conditions:
       - condition: state
-        entity: input_select.ZONE_daytime_mode
+        entity: switch.ZONE_daytime_detection_enabled
+        state: "on"
+      - condition: state
+        entity: select.ZONE_daytime_mode
         state: Lux Sensor
     card:
       type: entities
       entities:
-        - entity: input_number.ZONE_lux_threshold
+        - entity: number.ZONE_lux_threshold
           name: "Lux Threshold"
           secondary_info: "Activate when lux reading is below this value."
-        - entity: input_text.ZONE_lux_sensor_entity
+        - entity: text.ZONE_lux_sensor_entity
           name: "Lux Sensor Entity ID"
           secondary_info: "e.g. sensor.hallway_motion_1_illuminance"
 
-  # Dim window — nightlight time range
-  - type: entities
-    title: Nightlight Window
-    entities:
-      - entity: input_datetime.ZONE_dim_start
-        name: Start
-      - entity: input_datetime.ZONE_dim_end
-        name: End
+  # Nightlight window — only shown when nightlight is enabled
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: switch.ZONE_nightlight_enabled
+        state: "on"
+    card:
+      type: entities
+      title: Nightlight Window
+      entities:
+        - entity: time.ZONE_dim_start
+          name: Start
+        - entity: time.ZONE_dim_end
+          name: End
+        - entity: number.ZONE_dim_brightness
+          name: Nightlight Brightness
 
-  # Brightness sliders
+  # Brightness and timing
   - type: entities
-    title: Brightness
+    title: Settings
     entities:
-      - entity: input_number.ZONE_dim_brightness
-        name: Nightlight Brightness
-      - entity: input_number.ZONE_normal_brightness
+      - entity: number.ZONE_normal_brightness
         name: Normal Brightness
-
-  # Safety / timing
-  - type: entities
-    title: Safety Settings
-    entities:
-      - entity: input_number.ZONE_motion_timeout_min
-        name: Stuck Sensor Timeout
-        secondary_info: "Lights turn off after this many minutes if sensors never clear."
+      - entity: number.ZONE_light_on_time_sec
+        name: Light On Time
+        secondary_info: "Maximum seconds lights stay on waiting for sensors to clear. Must exceed your sensor's onboard re-trigger timeout."

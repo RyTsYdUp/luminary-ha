@@ -37,13 +37,13 @@ input_boolean:
 
 input_number:
 
-  ZONE_motion_timeout_min:
-    name: "ROOM_NAME — Stuck Sensor Timeout"
-    min: 1
-    max: 30
-    step: 1
-    initial: 2
-    unit_of_measurement: min
+  ZONE_light_on_time_sec:
+    name: "ROOM_NAME — Light On Time"
+    min: 10
+    max: 600
+    step: 5
+    initial: 60
+    unit_of_measurement: s
     icon: mdi-timer-outline
 
   ZONE_sun_elevation_threshold:
@@ -273,8 +273,8 @@ automation:
 
       - variables:
           motion_timeout: >
-            {% set mins = states('input_number.ZONE_motion_timeout_min') | int(2) %}
-            {{ '%02d:%02d:00' % (mins // 60, mins % 60) }}
+            {% set secs = states('input_number.ZONE_light_on_time_sec') | int(60) %}
+            {{ '%02d:%02d:%02d' % (secs // 3600, (secs % 3600) // 60, secs % 60) }}
 
       # Wait for the sensor group to clear, or until safety timeout.
       # mode: restart means any new motion trigger resets this entire sequence,
@@ -576,3 +576,111 @@ automation:
         state: "off"
     action:
       - action: script.ZONE_set_brightness
+
+
+  # ---------------------------------------------------------------------------
+  # 10. STUCK SENSOR RESET (OPTIONAL) — recover stuck Z-Wave sensors
+  #
+  #   When lights turn off but the sensor group still reports motion, the
+  #   sensor likely missed its "clear" Z-Wave message. This automation polls
+  #   each sensor via Z-Wave JS to force a fresh state report.
+  #
+  #   Requires: Z-Wave JS integration.
+  #   Remove SENSOR_2 / SENSOR_3 lines from trigger and action if not used.
+  # ---------------------------------------------------------------------------
+  - id: ZONE_stuck_sensor_reset
+    alias: "ROOM_NAME — Stuck Sensor Reset"
+    description: >
+      When lights turn off but sensors are still reporting motion, polls each
+      sensor via Z-Wave JS to recover from a missed clear message.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: LIGHT_ENTITY
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.ZONE_motion_sensors
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.ZONE_automation_disabled
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.ZONE_motion_blocker
+        state: "off"
+    action:
+      - action: zwave_js.refresh_value
+        target:
+          entity_id:
+            - SENSOR_1
+            - SENSOR_2   # remove if fewer than 3 sensors
+            - SENSOR_3   # remove if fewer than 3 sensors
+
+
+  # ---------------------------------------------------------------------------
+  # 11. SENSOR UNAVAILABLE (OPTIONAL) — alert when a sensor goes offline
+  #
+  #   Creates a persistent HA notification when any motion sensor becomes
+  #   unavailable. Pair with automation 12 to auto-dismiss on recovery.
+  #   Remove SENSOR_2 / SENSOR_3 lines if not used.
+  # ---------------------------------------------------------------------------
+  - id: ZONE_sensor_unavailable_notify
+    alias: "ROOM_NAME — Sensor Unavailable"
+    description: >
+      Creates a persistent notification when any motion sensor becomes
+      unavailable, indicating a possible Z-Wave mesh issue.
+    mode: queued
+    max: 3
+    trigger:
+      - platform: state
+        entity_id:
+          - SENSOR_1
+          - SENSOR_2   # remove if fewer than 3 sensors
+          - SENSOR_3   # remove if fewer than 3 sensors
+        to: "unavailable"
+    action:
+      - action: persistent_notification.create
+        data:
+          notification_id: ZONE_sensor_unavailable
+          title: "ROOM_NAME: Motion Sensor Unavailable"
+          message: >
+            {{ trigger.to_state.attributes.friendly_name
+               | default(trigger.to_state.entity_id) }}
+            is unavailable. ROOM_NAME motion detection may be impaired.
+            Check your Z-Wave network.
+
+
+  # ---------------------------------------------------------------------------
+  # 12. SENSOR UNAVAILABLE CLEARED (OPTIONAL) — dismiss alert on recovery
+  #
+  #   Dismisses the unavailability notification once all sensors are back
+  #   online. Pair with automation 11.
+  #   Remove SENSOR_2 / SENSOR_3 lines from trigger if not used; they are
+  #   safe to leave in the condition template (unknown ≠ unavailable).
+  # ---------------------------------------------------------------------------
+  - id: ZONE_sensor_unavailable_clear
+    alias: "ROOM_NAME — Sensor Unavailable Cleared"
+    description: >
+      Dismisses the unavailability notification once all sensors are
+      back online.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - SENSOR_1
+          - SENSOR_2   # remove if fewer than 3 sensors
+          - SENSOR_3   # remove if fewer than 3 sensors
+        from: "unavailable"
+    condition:
+      - condition: template
+        value_template: >
+          {% set sensors = [
+            states('SENSOR_1'),
+            states('SENSOR_2'),
+            states('SENSOR_3')
+          ] %}
+          {{ 'unavailable' not in sensors }}
+    action:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: ZONE_sensor_unavailable
