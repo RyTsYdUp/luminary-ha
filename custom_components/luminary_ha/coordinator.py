@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant, callback, Event
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
@@ -20,6 +21,7 @@ from .const import (
     CONF_ZONE_NAME,
     CONF_AREA,
     DAYTIME_MODE_SUN,
+    DOMAIN,
     ZWAVE_SCENE_VALUE_SINGLE,
     ZWAVE_SCENE_VALUE_DOUBLE,
     ZWAVE_SCENE_KEY_UP,
@@ -77,6 +79,21 @@ class ZoneCoordinator:
     # ------------------------------------------------------------------
 
     def eid(self, domain: str, suffix: str) -> str:
+        """Return the entity_id for a coordinator-owned entity.
+
+        Looks up the entity registry by unique_id so this works regardless of
+        how HA generated the entity_id (device renames, area prefixes, etc.).
+        Falls back to the constructed ID for tests or pre-registration calls.
+        """
+        try:
+            ent_reg = er.async_get(self.hass)
+            entity_id = ent_reg.async_get_entity_id(
+                domain, DOMAIN, f"{self.entry.entry_id}_{suffix}"
+            )
+            if isinstance(entity_id, str):
+                return entity_id
+        except Exception:
+            pass
         return f"{domain}.{self.zone_id}_{suffix}"
 
     def _state(self, entity_id: str) -> str | None:
@@ -283,7 +300,7 @@ class ZoneCoordinator:
         try:
             await self._light_on()
 
-            # Wait for all sensors to clear, or until the safety timeout fires
+            # Wait for all sensors to clear. 30-minute cap handles stuck sensors.
             cleared = asyncio.Event()
 
             @callback
@@ -294,12 +311,18 @@ class ZoneCoordinator:
             unsub = async_track_state_change_event(
                 self.hass, self.sensors, _on_change
             )
+            stuck = False
             try:
-                await asyncio.wait_for(cleared.wait(), timeout=float(self.light_on_time_sec))
+                await asyncio.wait_for(cleared.wait(), timeout=1800)
             except asyncio.TimeoutError:
-                pass
+                stuck = True
             finally:
                 unsub()
+
+            # Post-motion delay: keep the light on for light_on_time_sec after
+            # all motion clears (skipped when sensors are stuck).
+            if not stuck:
+                await asyncio.sleep(float(self.light_on_time_sec))
 
             # Re-check overrides before turning off (may have changed during wait)
             if self.automation_disabled or self.motion_blocker:
@@ -332,7 +355,7 @@ class ZoneCoordinator:
     @callback
     def _handle_zwave_event(self, event: Event) -> None:
         data = event.data
-        if data.get("device_id") != self.switch_device:
+        if self.switch_device and data.get("device_id") != self.switch_device:
             return
         if data.get("command_class") != 91:
             return
@@ -364,7 +387,7 @@ class ZoneCoordinator:
             return
         await self._set_switch("turn_off", self.eid("switch", "motion_blocker"))
         if self._sensors_any_on:
-            await self._light_on()
+            self._restart_motion_task()
         else:
             await self._light_off()
 
@@ -376,8 +399,9 @@ class ZoneCoordinator:
     async def _double_tap_down(self) -> None:
         """Disable dumb mode; resume automation."""
         await self._set_switch("turn_off", self.eid("switch", "automation_disabled"))
+        await self._set_switch("turn_off", self.eid("switch", "motion_blocker"))
         if self._sensors_any_on:
-            await self._light_on()
+            self._restart_motion_task()
         else:
             await self._light_off()
 
@@ -484,15 +508,33 @@ class ZoneCoordinator:
     # ------------------------------------------------------------------
 
     async def async_setup(self) -> None:
-        """Register all event listeners."""
-        # Sensor state changes (motion + unavailable)
+        """Register listeners for external entities (sensors, Z-Wave).
+
+        Own-entity listeners require the entity registry to be populated first;
+        call async_register_entity_listeners() after platforms are set up.
+        """
         if self.sensors:
             self._unsub_listeners.append(
                 async_track_state_change_event(
                     self.hass, self.sensors, self._handle_sensor_change
                 )
             )
-        # Entities that affect the status sensor display
+        self._unsub_listeners.append(
+            self.hass.bus.async_listen(
+                "zwave_js_value_notification", self._handle_zwave_event
+            )
+        )
+        self._sensors_any_on = any(
+            self.hass.states.is_state(s, "on") for s in self.sensors
+        )
+
+    @callback
+    def async_register_entity_listeners(self) -> None:
+        """Register state-change listeners for own entities.
+
+        Must be called after async_forward_entry_setups() so the entity
+        registry is populated and eid() can resolve the correct entity_ids.
+        """
         self._unsub_listeners.append(
             async_track_state_change_event(
                 self.hass,
@@ -507,24 +549,12 @@ class ZoneCoordinator:
                 self._handle_status_trigger,
             )
         )
-        # Dim time entity changes
         self._unsub_listeners.append(
             async_track_state_change_event(
                 self.hass,
                 [self.eid("time", "dim_start"), self.eid("time", "dim_end")],
                 self._handle_dim_time_entity_changed,
             )
-        )
-        # Z-Wave switch events
-        if self.switch_device:
-            self._unsub_listeners.append(
-                self.hass.bus.async_listen(
-                    "zwave_js_value_notification", self._handle_zwave_event
-                )
-            )
-        # Initial group state
-        self._sensors_any_on = any(
-            self.hass.states.is_state(s, "on") for s in self.sensors
         )
 
     async def async_unload(self) -> None:
