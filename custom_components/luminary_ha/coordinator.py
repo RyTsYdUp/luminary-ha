@@ -35,6 +35,8 @@ _LOGGER = logging.getLogger(__name__)
 class ZoneCoordinator:
     """Coordinates all automation logic for a single Luminary zone."""
 
+    _stuck_timeout: int = 1800  # seconds; override in tests
+
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self.entry = entry
@@ -313,7 +315,7 @@ class ZoneCoordinator:
             )
             stuck = False
             try:
-                await asyncio.wait_for(cleared.wait(), timeout=1800)
+                await asyncio.wait_for(cleared.wait(), timeout=self._stuck_timeout)
             except asyncio.TimeoutError:
                 stuck = True
             finally:

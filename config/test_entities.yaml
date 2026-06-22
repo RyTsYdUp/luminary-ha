@@ -1,0 +1,164 @@
+---
+# Test entities for luminary-ha E2E tests on the test HA instance.
+# Deploy to: /config/packages/test_entities.yaml
+# After changes: ha core restart
+#
+# BRIGHTNESS SUPPORT (needed for T11-T14 dim window tests):
+# The template light must expose a `brightness` attribute that reflects the last
+# brightness_pct passed to light.turn_on.  A simple approach using input_number:
+#
+#   input_number:
+#     test_hallway_light_brightness:
+#       min: 0
+#       max: 255
+#       step: 1
+#
+# The template light's turn_on action should call input_number.set_value with
+# {{ (brightness_pct / 100 * 255) | round | int }} and the brightness template
+# should read back {{ states('input_number.test_hallway_light_brightness') | int }}.
+#
+# ── NOTE ────────────────────────────────────────────────────────────────────────
+# The sections below contain ONLY the parts that were changed or are known to be
+# correct.  Retrieve the live file from the test HA before deploying:
+#   scp root@192.168.30.100:/config/packages/test_entities.yaml config/test_entities.yaml
+# Then apply the automation value changes shown below.
+# ────────────────────────────────────────────────────────────────────────────────
+
+input_boolean:
+  test_motion_1:
+    name: Test Motion 1
+  test_motion_2:
+    name: Test Motion 2
+  test_hallway_light_on:
+    name: Test Hallway Light On
+
+input_number:
+  test_hallway_light_brightness:
+    name: Test Hallway Light Brightness
+    min: 0
+    max: 255
+    step: 1
+
+input_button:
+  test_switch_single_up:
+    name: Test Switch Single Up
+  test_switch_single_down:
+    name: Test Switch Single Down
+  test_switch_double_up:
+    name: Test Switch Double Up
+  test_switch_double_down:
+    name: Test Switch Double Down
+  test_switch_scene3:
+    name: Test Switch Scene 3
+
+template:
+  - binary_sensor:
+      - name: Test Hallway Motion 1
+        unique_id: test_hallway_motion_1
+        device_class: motion
+        state: "{{ is_state('input_boolean.test_motion_1', 'on') }}"
+
+      - name: Test Hallway Motion 2
+        unique_id: test_hallway_motion_2
+        device_class: motion
+        state: "{{ is_state('input_boolean.test_motion_2', 'on') }}"
+
+  - light:
+      - name: Test Hallway Light
+        unique_id: test_hallway_light
+        state: "{{ is_state('input_boolean.test_hallway_light_on', 'on') }}"
+        brightness: "{{ states('input_number.test_hallway_light_brightness') | int(0) }}"
+        turn_on:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.test_hallway_light_on
+          - if:
+              - condition: template
+                value_template: "{{ brightness is defined }}"
+            then:
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.test_hallway_light_brightness
+                data:
+                  value: "{{ brightness }}"
+        turn_off:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.test_hallway_light_on
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.test_hallway_light_brightness
+            data:
+              value: 0
+
+# ── Z-Wave switch simulations ──────────────────────────────────────────────────
+# CRITICAL: values must be strings ("KeyPressed" / "KeyPressed2x") matching what
+# zwave_js_value_notification actually sends from the Zooz ZSE11.
+# Confirmed 2026-06-22 via production HA WebSocket capture.
+# Old incorrect values were integers: 0 (single) and 3 (double).
+
+automation:
+  - id: luminary_test_switch_single_up
+    alias: "luminary_test: single tap up"
+    trigger:
+      - platform: state
+        entity_id: input_button.test_switch_single_up
+    action:
+      - event: zwave_js_value_notification
+        event_data:
+          device_id: test_switch_device
+          command_class: 91
+          property_key: "001"
+          value: "KeyPressed"
+
+  - id: luminary_test_switch_single_down
+    alias: "luminary_test: single tap down"
+    trigger:
+      - platform: state
+        entity_id: input_button.test_switch_single_down
+    action:
+      - event: zwave_js_value_notification
+        event_data:
+          device_id: test_switch_device
+          command_class: 91
+          property_key: "002"
+          value: "KeyPressed"
+
+  - id: luminary_test_switch_double_up
+    alias: "luminary_test: double tap up"
+    trigger:
+      - platform: state
+        entity_id: input_button.test_switch_double_up
+    action:
+      - event: zwave_js_value_notification
+        event_data:
+          device_id: test_switch_device
+          command_class: 91
+          property_key: "001"
+          value: "KeyPressed2x"
+
+  - id: luminary_test_switch_double_down
+    alias: "luminary_test: double tap down"
+    trigger:
+      - platform: state
+        entity_id: input_button.test_switch_double_down
+    action:
+      - event: zwave_js_value_notification
+        event_data:
+          device_id: test_switch_device
+          command_class: 91
+          property_key: "002"
+          value: "KeyPressed2x"
+
+  - id: luminary_test_switch_scene3
+    alias: "luminary_test: scene 3 / config"
+    trigger:
+      - platform: state
+        entity_id: input_button.test_switch_scene3
+    action:
+      - event: zwave_js_value_notification
+        event_data:
+          device_id: test_switch_device
+          command_class: 91
+          property_key: "003"
+          value: "KeyPressed"

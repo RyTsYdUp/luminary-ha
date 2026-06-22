@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Automated E2E tests for luminary-ha on the test HA instance."""
 import json, time, urllib.request, urllib.error, os, sys
+from datetime import datetime, timedelta
 
 BASE = "http://supervisor/core/api"
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -50,6 +51,29 @@ def check(label, entity_id, expected):
     return ok
 
 
+def brightness_pct(entity_id):
+    """Return light brightness as 0-100%, or None if unavailable."""
+    r = api("GET", f"states/{entity_id}")
+    b = r.get("attributes", {}).get("brightness")
+    return round(b / 255 * 100) if b is not None else None
+
+
+def check_bri(label, entity_id, expected_pct, tolerance=5):
+    actual = brightness_pct(entity_id)
+    ok = actual is not None and abs(actual - expected_pct) <= tolerance
+    print(f"  {'OK' if ok else 'FAIL'} {label}: brightness={actual}% (want ~{expected_pct}%±{tolerance})")
+    return ok
+
+
+def _next_minute_target(min_gap_secs=45):
+    """Return (datetime, wait_secs) for the next minute boundary >= min_gap_secs from now."""
+    now = datetime.now()
+    candidate = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    if (candidate - now).total_seconds() < min_gap_secs:
+        candidate += timedelta(minutes=1)
+    return candidate, int((candidate - now).total_seconds()) + 5
+
+
 LIGHT    = "light.test_hallway_light"
 DISABLED = "switch.hallway_hallway_light_automation_automation_disabled"
 BLOCKER  = "switch.hallway_hallway_light_automation_manual_override"
@@ -57,6 +81,13 @@ DAY_DET  = "switch.hallway_hallway_light_automation_daytime_detection"
 LOT      = "number.hallway_hallway_light_automation_light_on_time"
 M1 = "input_boolean.test_motion_1"
 M2 = "input_boolean.test_motion_2"
+
+# Nightlight / dim window entities
+NIGHTLIGHT = "switch.hallway_hallway_light_automation_nightlight"
+DIM_BRI    = "number.hallway_hallway_light_automation_nightlight_brightness"
+NORM_BRI   = "number.hallway_hallway_light_automation_normal_brightness"
+DIM_START  = "time.hallway_hallway_light_automation_nightlight_window_start"
+DIM_END    = "time.hallway_hallway_light_automation_nightlight_window_end"
 
 
 def reset():
@@ -208,6 +239,104 @@ call("input_boolean", "turn_off", entity_id=M1)
 r10b, t10 = wait_for_state(LIGHT, "off", timeout=WAIT)
 print(f"  {'OK' if r10b else 'FAIL'} light off after final delay: {state(LIGHT)!r} at {t10:.0f}s")
 results.append(("T10 motion restart", r10a and r10b))
+
+
+# ── Nightlight / dim window tests ────────────────────────────────────────────
+# Setup: nightlight on, distinctive brightness values, daytime detection off.
+# reset() clears sensors + overrides but does NOT touch nightlight state.
+
+call("switch", "turn_on", entity_id=NIGHTLIGHT)
+time.sleep(0.5)
+call("number", "set_value", entity_id=DIM_BRI, value=20)
+call("number", "set_value", entity_id=NORM_BRI, value=80)
+time.sleep(0.5)
+
+
+# ── T11: Motion during dim window → dim brightness ────────────────────────────
+print("\n=== T11: Motion during dim window → light on at dim brightness ===")
+now = datetime.now()
+call("time", "set_value", entity_id=DIM_START, time=(now - timedelta(hours=1)).strftime("%H:%M:00"))
+call("time", "set_value", entity_id=DIM_END,   time=(now + timedelta(hours=1)).strftime("%H:%M:00"))
+time.sleep(0.5)
+reset()
+call("input_boolean", "turn_on", entity_id=M1)
+time.sleep(1)
+t11a = check("light on", LIGHT, "on")
+t11b = check_bri("dim brightness applied", LIGHT, 20)
+call("input_boolean", "turn_off", entity_id=M1)
+t11c, _ = wait_for_state(LIGHT, "off", timeout=WAIT)
+print(f"  {'OK' if t11c else 'FAIL'} light off after delay")
+results.append(("T11 motion in dim window", t11a and t11b and t11c))
+
+
+# ── T12: Motion outside dim window → normal brightness ───────────────────────
+print("\n=== T12: Motion outside dim window → light on at normal brightness ===")
+now = datetime.now()
+call("time", "set_value", entity_id=DIM_START, time=(now + timedelta(hours=2)).strftime("%H:%M:00"))
+call("time", "set_value", entity_id=DIM_END,   time=(now + timedelta(hours=3)).strftime("%H:%M:00"))
+time.sleep(0.5)
+reset()
+call("input_boolean", "turn_on", entity_id=M1)
+time.sleep(1)
+t12a = check("light on", LIGHT, "on")
+t12b = check_bri("normal brightness applied", LIGHT, 80)
+call("input_boolean", "turn_off", entity_id=M1)
+t12c, _ = wait_for_state(LIGHT, "off", timeout=WAIT)
+print(f"  {'OK' if t12c else 'FAIL'} light off after delay")
+results.append(("T12 motion outside dim window", t12a and t12b and t12c))
+
+
+# ── T13: Dim window START fires → running light dims ─────────────────────────
+print("\n=== T13: Dim window start fires → light dims while on ===")
+target13, wait13 = _next_minute_target()
+now = datetime.now()
+# Window: starts at target13 (future), ends 1h after now (so we don't exit during wait)
+call("time", "set_value", entity_id=DIM_START, time=target13.strftime("%H:%M:00"))
+call("time", "set_value", entity_id=DIM_END,   time=(now + timedelta(hours=1)).strftime("%H:%M:00"))
+time.sleep(0.5)
+reset()
+call("input_boolean", "turn_on", entity_id=M1)
+time.sleep(1)
+t13a = check("light on before dim window", LIGHT, "on")
+t13b = check_bri("normal brightness before dim_start", LIGHT, 80)
+print(f"  Waiting {wait13}s for dim_start ({target13.strftime('%H:%M:00')}) to fire...")
+time.sleep(wait13)
+t13c = check("light still on", LIGHT, "on")
+t13d = check_bri("dim brightness after dim_start fires", LIGHT, 20)
+call("input_boolean", "turn_off", entity_id=M1)
+wait_for_state(LIGHT, "off", timeout=WAIT)
+results.append(("T13 dim window start transition", t13a and t13b and t13c and t13d))
+
+
+# ── T14: Dim window END fires → running light brightens ──────────────────────
+print("\n=== T14: Dim window end fires → light brightens while on ===")
+target14, wait14 = _next_minute_target()
+now = datetime.now()
+# Window: started 1h ago (inside now), ends at target14 (future)
+call("time", "set_value", entity_id=DIM_START, time=(now - timedelta(hours=1)).strftime("%H:%M:00"))
+call("time", "set_value", entity_id=DIM_END,   time=target14.strftime("%H:%M:00"))
+time.sleep(0.5)
+reset()
+call("input_boolean", "turn_on", entity_id=M1)
+time.sleep(1)
+t14a = check("light on during dim window", LIGHT, "on")
+t14b = check_bri("dim brightness while inside window", LIGHT, 20)
+print(f"  Waiting {wait14}s for dim_end ({target14.strftime('%H:%M:00')}) to fire...")
+time.sleep(wait14)
+t14c = check("light still on", LIGHT, "on")
+t14d = check_bri("normal brightness after dim_end fires", LIGHT, 80)
+call("input_boolean", "turn_off", entity_id=M1)
+wait_for_state(LIGHT, "off", timeout=WAIT)
+results.append(("T14 dim window end transition", t14a and t14b and t14c and t14d))
+
+
+# Restore nightlight entities to defaults
+call("number", "set_value", entity_id=DIM_BRI,  value=10)
+call("number", "set_value", entity_id=NORM_BRI,  value=100)
+call("time",   "set_value", entity_id=DIM_START, time="00:00:00")
+call("time",   "set_value", entity_id=DIM_END,   time="06:00:00")
+call("switch", "turn_off",  entity_id=NIGHTLIGHT)
+time.sleep(0.5)
 
 
 # ── Restore ───────────────────────────────────────────────────────────────────

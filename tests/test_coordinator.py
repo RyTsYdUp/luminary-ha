@@ -492,10 +492,10 @@ class TestMotionSequence:
 
     async def test_29_timeout_with_stuck_sensors_calls_refresh(self, coord, states):
         """Timeout fires with sensors still on → refresh_value called."""
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "1")   # very short timeout
         states.put(SENSOR_1, "on")
         states.put(SENSOR_2, "off")
-        coord._sensors_any_on = True  # group reflects sensors on
+        coord._sensors_any_on = True
+        coord._stuck_timeout = 0.01  # instant timeout; avoids 1800s real wait
 
         with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
             await coord._run_motion_sequence()
@@ -506,8 +506,8 @@ class TestMotionSequence:
 
     async def test_30_timeout_sensors_clear_no_refresh(self, coord, states):
         """Timeout fires with sensors already off → no refresh_value."""
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "1")
-        coord._sensors_any_on = False  # sensors already cleared
+        coord._sensors_any_on = False
+        coord._stuck_timeout = 0.01  # instant timeout
 
         with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
             await coord._run_motion_sequence()
@@ -537,7 +537,7 @@ class TestMotionSequence:
 
     async def test_32_automation_disabled_during_wait_skips_off(self, coord, states):
         """If automation_disabled turns on while waiting, don't turn off light."""
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "1")
+        coord._stuck_timeout = 0.01
         # Mark as disabled BEFORE timeout fires so the guard check catches it
         states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
 
@@ -604,20 +604,20 @@ class TestZwaveSwitchHandlers:
         assert len(blocker_calls) == 0
 
     async def test_37_single_tap_down_smart_sensors_on(self, coord, states):
-        """Smart + sensors on: release override, keep light on."""
+        """Smart + sensors on: release override and restart motion task (not light off)."""
         states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
         coord._sensors_any_on = True
+        coord._restart_motion_task = MagicMock()
         await coord._single_tap_down()
         coord.hass.services.async_call.assert_any_call(
             "switch", "turn_off",
             {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
             blocking=False,
         )
-        coord.hass.services.async_call.assert_any_call(
-            "light", "turn_on",
-            {"entity_id": LIGHT, "brightness_pct": coord.target_brightness(), "transition": 1},
-            blocking=False,
-        )
+        coord._restart_motion_task.assert_called_once()
+        # light off must NOT be called when resuming via motion task
+        off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
+        assert len(off_calls) == 0
 
     async def test_38_single_tap_down_smart_sensors_off(self, coord, states):
         """Smart + sensors off: release override, light off."""
@@ -651,19 +651,16 @@ class TestZwaveSwitchHandlers:
         )
 
     async def test_41_double_tap_down_sensors_on(self, coord):
-        """Double tap down: exit dumb mode, light on if sensors active."""
+        """Double tap down: exit dumb mode, restart motion task when sensors active."""
         coord._sensors_any_on = True
+        coord._restart_motion_task = MagicMock()
         await coord._double_tap_down()
         coord.hass.services.async_call.assert_any_call(
             "switch", "turn_off",
             {"entity_id": f"switch.{ZONE_ID}_automation_disabled"},
             blocking=False,
         )
-        on_calls = [
-            c for c in coord.hass.services.async_call.call_args_list
-            if c.args[:2] == ("light", "turn_on")
-        ]
-        assert len(on_calls) > 0
+        coord._restart_motion_task.assert_called_once()
 
     async def test_42_double_tap_down_sensors_off(self, coord):
         """Double tap down: exit dumb mode, light off if no sensors."""
