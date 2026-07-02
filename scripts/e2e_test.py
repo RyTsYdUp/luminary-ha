@@ -89,6 +89,14 @@ NORM_BRI   = "number.hallway_hallway_light_automation_normal_brightness"
 DIM_START  = "time.hallway_hallway_light_automation_nightlight_window_start"
 DIM_END    = "time.hallway_hallway_light_automation_nightlight_window_end"
 
+# Hardware-timeout entities — T15/T16 assume the zone's config entry already has
+# CONF_SENSOR_HW_TIMEOUTS injected for binary_sensor.test_hallway_motion_1, pointing
+# source_entity_id at HW_SOURCE (see scripts/inject_hw_timeout.py). If that injection
+# hasn't been done, T15/T16 are skipped rather than failed, same as any other
+# out-of-band test-rig precondition.
+HW_SOURCE   = "input_number.test_hw_timeout_source"
+HW_DISPLAY  = "sensor.hallway_hallway_light_automation_test_hallway_motion_1_hardware_timeout"
+
 
 def reset():
     call("input_boolean", "turn_off", entity_id=M1)
@@ -101,6 +109,13 @@ def reset():
 
 
 results = []
+
+HW_TIMEOUT_CONFIGURED = state(HW_SOURCE) != "?"
+if HW_TIMEOUT_CONFIGURED:
+    # Lower the injected hardware-timeout floor first so it doesn't block the
+    # short post-motion delay T1-T14 rely on for fast iteration.
+    call("input_number", "set_value", entity_id=HW_SOURCE, value=3)
+    time.sleep(1)
 
 # Set short post-motion delay for testing (entity min may clamp it)
 call("number", "set_value", entity_id=LOT, value=3)
@@ -337,6 +352,50 @@ call("time",   "set_value", entity_id=DIM_START, time="00:00:00")
 call("time",   "set_value", entity_id=DIM_END,   time="06:00:00")
 call("switch", "turn_off",  entity_id=NIGHTLIGHT)
 time.sleep(0.5)
+
+
+# ── Hardware-timeout floor enforcement + live update ─────────────────────────
+# Requires CONF_SENSOR_HW_TIMEOUTS pre-injected for the zone (see module docstring
+# for HW_SOURCE/HW_DISPLAY) — skipped entirely if the test rig doesn't have it.
+if HW_TIMEOUT_CONFIGURED:
+    def number_min(entity_id):
+        r = api("GET", f"states/{entity_id}")
+        return r.get("attributes", {}).get("min")
+
+    print("\n=== T15: Raising the hardware-timeout source auto-bumps light_on_time_sec ===")
+    call("number", "set_value", entity_id=LOT, value=10)
+    time.sleep(0.5)
+    call("input_number", "set_value", entity_id=HW_SOURCE, value=45)
+    time.sleep(1.5)
+    t15a = check("hardware-timeout display sensor reads 45", HW_DISPLAY, "45.0")
+    lot_after_bump = float(state(LOT))
+    t15b = lot_after_bump >= 45.0
+    print(f"  {'OK' if t15b else 'FAIL'} light_on_time_sec auto-bumped: {lot_after_bump} (want >= 45)")
+    t15c = number_min(LOT) == 45.0
+    print(f"  {'OK' if t15c else 'FAIL'} light_on_time_sec min attribute: {number_min(LOT)} (want 45.0)")
+
+    resp = call("number", "set_value", entity_id=LOT, value=10)  # below the 45s floor
+    t15d = isinstance(resp, dict) and "error" in resp
+    print(f"  {'OK' if t15d else 'FAIL'} setting below floor rejected: {resp}")
+    t15e = float(state(LOT)) == lot_after_bump  # unchanged after the rejected attempt
+    print(f"  {'OK' if t15e else 'FAIL'} light_on_time_sec unchanged after rejected set: {state(LOT)}")
+    results.append(("T15 floor enforcement + auto-bump", t15a and t15b and t15c and t15d and t15e))
+
+    print("\n=== T16: Lowering the hardware-timeout source updates the display + min live (no restart) ===")
+    call("input_number", "set_value", entity_id=HW_SOURCE, value=20)
+    time.sleep(1.5)
+    t16a = check("hardware-timeout display sensor reads 20", HW_DISPLAY, "20.0")
+    t16b = number_min(LOT) == 20.0
+    print(f"  {'OK' if t16b else 'FAIL'} light_on_time_sec min attribute lowered live: {number_min(LOT)} (want 20.0)")
+    t16c = float(state(LOT)) == lot_after_bump  # value itself never auto-lowers
+    print(f"  {'OK' if t16c else 'FAIL'} light_on_time_sec value unchanged (no auto-lower): {state(LOT)}")
+    results.append(("T16 live-update propagation", t16a and t16b and t16c))
+
+    # Reset the injected source back to a low value so it doesn't interfere with reruns
+    call("input_number", "set_value", entity_id=HW_SOURCE, value=3)
+    time.sleep(0.5)
+else:
+    print("\n(T15/T16 skipped — HW_SOURCE not configured on this test rig)")
 
 
 # ── Restore ───────────────────────────────────────────────────────────────────

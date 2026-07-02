@@ -33,6 +33,7 @@ class LuminaryNumberDescription(NumberEntityDescription):
     default: float = 0.0
     requires_nightlight: bool = False
     requires_daytime_mode: str | None = None
+    dynamic_min_from_sensors: bool = False
 
 
 NUMBERS: tuple[LuminaryNumberDescription, ...] = (
@@ -41,10 +42,11 @@ NUMBERS: tuple[LuminaryNumberDescription, ...] = (
         translation_key="light_on_time_sec",
         icon="mdi:timer-outline",
         native_unit_of_measurement=UnitOfTime.SECONDS,
-        native_min_value=10,
+        native_min_value=10,  # absolute floor for zones with no confirmed hardware timeouts yet
         native_max_value=600,
         native_step=5,
         default=DEFAULT_LIGHT_ON_TIME,
+        dynamic_min_from_sensors=True,
     ),
     LuminaryNumberDescription(
         key="sun_elevation_threshold",
@@ -98,7 +100,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: ZoneCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(LuminaryNumber(coordinator, desc) for desc in NUMBERS)
+    entities = [LuminaryNumber(coordinator, desc) for desc in NUMBERS]
+    for entity in entities:
+        if entity.entity_description.key == "light_on_time_sec":
+            coordinator.light_on_time_entity = entity
+    async_add_entities(entities)
 
 
 class LuminaryNumber(NumberEntity, RestoreEntity):
@@ -120,6 +126,12 @@ class LuminaryNumber(NumberEntity, RestoreEntity):
             model="Motion Zone",
             suggested_area=coordinator.area_id,
         )
+
+    @property
+    def native_min_value(self) -> float:
+        if self.entity_description.dynamic_min_from_sensors:
+            return max(self.entity_description.native_min_value, self._coordinator.max_sensor_hw_timeout())
+        return self.entity_description.native_min_value
 
     @property
     def available(self) -> bool:

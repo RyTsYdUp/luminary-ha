@@ -20,6 +20,14 @@ input_number:
     step: 1
     initial: 255
     icon: mdi:brightness-6
+  test_hw_timeout_source:
+    name: "Test — Hardware Timeout Source"
+    min: 0
+    max: 600
+    step: 1
+    initial: 10
+    unit_of_measurement: "s"
+    icon: mdi:timer-outline
 
 input_button:
   test_switch_single_up:

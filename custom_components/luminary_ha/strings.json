@@ -16,6 +16,16 @@
           "light": "The light entity to control",
           "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
         }
+      },
+      "confirm_timeout": {
+        "title": "Confirm hardware timeout — {sensor_name}",
+        "description": "{status}\n\nSensors remaining after this one: {remaining}",
+        "data": {
+          "hw_timeout_sec": "Hardware clear timeout (seconds)"
+        },
+        "data_description": {
+          "hw_timeout_sec": "How long this sensor's own onboard timer waits after motion stops before it reports clear. Used as the minimum allowed post-motion delay to prevent light flicker."
+        }
       }
     },
     "abort": {
@@ -23,7 +33,8 @@
     },
     "error": {
       "area_not_found": "Selected area no longer exists.",
-      "no_sensors": "At least one motion sensor is required."
+      "no_sensors": "At least one motion sensor is required.",
+      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow."
     }
   },
   "options": {
@@ -41,10 +52,97 @@
           "light": "The light entity to control",
           "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
         }
+      },
+      "confirm_timeout": {
+        "title": "Confirm hardware timeout — {sensor_name}",
+        "description": "{status}\n\nSensors remaining after this one: {remaining}",
+        "data": {
+          "hw_timeout_sec": "Hardware clear timeout (seconds)"
+        },
+        "data_description": {
+          "hw_timeout_sec": "How long this sensor's own onboard timer waits after motion stops before it reports clear. Used as the minimum allowed post-motion delay to prevent light flicker."
+        }
       }
     },
     "error": {
-      "no_sensors": "At least one motion sensor is required."
+      "no_sensors": "At least one motion sensor is required.",
+      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "motion_group": {
+        "name": "Motion"
+      }
+    },
+    "button": {
+      "refresh_hw_timeouts": {
+        "name": "Refresh Hardware Timeouts"
+      }
+    },
+    "number": {
+      "light_on_time_sec": {
+        "name": "Light On Time"
+      },
+      "sun_elevation_threshold": {
+        "name": "Sun Elevation Threshold"
+      },
+      "lux_threshold": {
+        "name": "Lux Threshold"
+      },
+      "dim_brightness": {
+        "name": "Nightlight Brightness"
+      },
+      "normal_brightness": {
+        "name": "Normal Brightness"
+      }
+    },
+    "select": {
+      "daytime_mode": {
+        "name": "Daytime Mode",
+        "state": {
+          "Sun Elevation": "Sun Elevation",
+          "Lux Sensor": "Lux Sensor"
+        }
+      }
+    },
+    "sensor": {
+      "automation_status": {
+        "name": "Automation Status",
+        "state": {
+          "Automated": "Automated",
+          "Standby": "Standby",
+          "Manual Override": "Manual Override",
+          "Disabled": "Disabled"
+        }
+      }
+    },
+    "switch": {
+      "daytime_detection_enabled": {
+        "name": "Daytime Detection"
+      },
+      "nightlight_enabled": {
+        "name": "Nightlight"
+      },
+      "motion_blocker": {
+        "name": "Manual Override"
+      },
+      "automation_disabled": {
+        "name": "Automation Disabled"
+      }
+    },
+    "text": {
+      "lux_sensor_entity": {
+        "name": "Lux Sensor Entity"
+      }
+    },
+    "time": {
+      "dim_start": {
+        "name": "Nightlight Window Start"
+      },
+      "dim_end": {
+        "name": "Nightlight Window End"
+      }
     }
   }
 }

@@ -10,6 +10,7 @@ import asyncio
 import json
 import sys
 import argparse
+from pathlib import Path
 
 try:
     import websockets
@@ -17,8 +18,13 @@ except ImportError:
     print("Missing dependency: pip install websockets")
     sys.exit(1)
 
-# Production HA token
-TOKEN = "***REMOVED-REVOKED-HA-TOKEN***"
+CREDENTIALS_PATH = Path.home() / ".claude" / "homelab_credentials.json"
+
+
+def load_token() -> str:
+    with open(CREDENTIALS_PATH, encoding="utf-8") as f:
+        creds = json.load(f)
+    return creds["home_assistant"]["token"]
 
 # Z-Wave Central Scene key labels (from const.py)
 KEY_LABELS = {"001": "UP", "002": "DOWN", "003": "CONFIG/SCENE3"}
@@ -34,13 +40,14 @@ VALUE_LABELS = {
 
 async def listen(host: str, port: int) -> None:
     url = f"ws://{host}:{port}/api/websocket"
+    token = load_token()
     print(f"Connecting to {url} ...")
 
     async with websockets.connect(url) as ws:
         msg = json.loads(await ws.recv())
         assert msg["type"] == "auth_required", f"Unexpected first message: {msg}"
 
-        await ws.send(json.dumps({"type": "auth", "access_token": TOKEN}))
+        await ws.send(json.dumps({"type": "auth", "access_token": token}))
         msg = json.loads(await ws.recv())
         if msg["type"] != "auth_ok":
             print(f"Auth failed: {msg}")

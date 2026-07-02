@@ -7,6 +7,12 @@ CONF_ZONE_ID = "zone_id"     # slug derived from area name (e.g. "hallway")
 CONF_SENSORS = "sensors"
 CONF_LIGHT = "light"
 CONF_SWITCH_DEVICE = "switch_device"
+CONF_SENSOR_HW_TIMEOUTS = "sensor_hw_timeouts"  # dict[str, dict] — see hw_timeout.py
+
+# Motion/occupancy sensor device classes accepted when picking zone sensors. Zigbee2MQTT
+# PIR sensors report device_class "occupancy", not "motion" — both must be accepted or
+# every Zigbee sensor in the house is silently unselectable.
+MOTION_DEVICE_CLASSES = ["motion", "occupancy"]
 
 # Daytime suppression modes
 DAYTIME_MODE_SUN = "Sun Elevation"
@@ -29,3 +35,24 @@ ZWAVE_SCENE_VALUE_DOUBLE = "KeyPressed2x"
 ZWAVE_SCENE_KEY_UP = "001"
 ZWAVE_SCENE_KEY_DOWN = "002"
 ZWAVE_SCENE_KEY_CONFIG = "003"
+
+# --- Hardware motion-clear-timeout auto-detection (hw_timeout.py) ---
+#
+# Z-Wave JS Configuration CC parameter entities have unique_ids shaped
+# "{homeId}.{nodeId}-112-0-{paramNumber}" (112 = Configuration CC, endpoint 0).
+# Confirmed against a real Zooz ZSE11 (pantry): param 13 unique_id was exactly
+# "4246878805.48-112-0-13", original_name "Motion Detection: Timeout", and disabled
+# by default (disabled_by="integration") — true for every Configuration CC entity on
+# that device, not just param 13.
+ZWAVE_CONFIG_CC = "112"
+ZWAVE_CONFIG_PARAM_TIMEOUT_MAP: dict[tuple[str, str], int] = {
+    ("Zooz", "ZSE11"): 13,
+}
+ZWAVE_TIMEOUT_KEYWORD_HINTS = ("timeout", "duration")  # fallback only for unmapped (manufacturer, model)
+
+# Zigbee2MQTT (via HA's mqtt platform) entity unique_ids are shaped
+# "{ieeeAddr}_{property_key}_zigbee2mqtt". Confirmed against a real Philips Hue motion
+# sensor (laundry room): "0x0017880109197d51_occupancy_timeout_zigbee2mqtt", enabled by
+# default (unlike Z-Wave Configuration entities).
+ZIGBEE2MQTT_UNIQUE_ID_SUFFIX = "_zigbee2mqtt"
+ZIGBEE2MQTT_TIMEOUT_PROPERTY_KEYS = ("occupancy_timeout",)

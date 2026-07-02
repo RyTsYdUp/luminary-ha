@@ -15,6 +15,10 @@ venv/
 # Generated room-specific packages (output from setup.sh)
 output/
 
+# Motion event capture output (scripts/capture_motion_events.py) — data, not source
+scripts/motion_capture_*.jsonl
+scripts/capture_logs/
+
 # OS files
 .DS_Store
 Thumbs.db

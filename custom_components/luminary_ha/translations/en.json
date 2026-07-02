@@ -16,6 +16,16 @@
           "light": "The light entity to control",
           "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
         }
+      },
+      "confirm_timeout": {
+        "title": "Confirm hardware timeout — {sensor_name}",
+        "description": "{status}\n\nSensors remaining after this one: {remaining}",
+        "data": {
+          "hw_timeout_sec": "Hardware clear timeout (seconds)"
+        },
+        "data_description": {
+          "hw_timeout_sec": "How long this sensor's own onboard timer waits after motion stops before it reports clear. Used as the minimum allowed post-motion delay to prevent light flicker."
+        }
       }
     },
     "abort": {
@@ -23,7 +33,8 @@
     },
     "error": {
       "area_not_found": "Selected area no longer exists.",
-      "no_sensors": "At least one motion sensor is required."
+      "no_sensors": "At least one motion sensor is required.",
+      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow."
     }
   },
   "options": {
@@ -41,16 +52,32 @@
           "light": "The light entity to control",
           "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
         }
+      },
+      "confirm_timeout": {
+        "title": "Confirm hardware timeout — {sensor_name}",
+        "description": "{status}\n\nSensors remaining after this one: {remaining}",
+        "data": {
+          "hw_timeout_sec": "Hardware clear timeout (seconds)"
+        },
+        "data_description": {
+          "hw_timeout_sec": "How long this sensor's own onboard timer waits after motion stops before it reports clear. Used as the minimum allowed post-motion delay to prevent light flicker."
+        }
       }
     },
     "error": {
-      "no_sensors": "At least one motion sensor is required."
+      "no_sensors": "At least one motion sensor is required.",
+      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow."
     }
   },
   "entity": {
     "binary_sensor": {
       "motion_group": {
         "name": "Motion"
+      }
+    },
+    "button": {
+      "refresh_hw_timeouts": {
+        "name": "Refresh Hardware Timeouts"
       }
     },
     "number": {

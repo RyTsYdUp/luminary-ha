@@ -6,7 +6,7 @@ from homeassistant.core import HomeAssistant
 from .const import DOMAIN
 from .coordinator import ZoneCoordinator
 
-PLATFORMS = ["binary_sensor", "number", "select", "sensor", "switch", "text", "time"]
+PLATFORMS = ["binary_sensor", "button", "number", "select", "sensor", "switch", "text", "time"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

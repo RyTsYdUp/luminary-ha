@@ -10,7 +10,9 @@ from .const import (
     CONF_SWITCH_DEVICE,
     CONF_ZONE_ID,
     CONF_ZONE_NAME,
+    DOMAIN,
 )
+from .coordinator import ZoneCoordinator
 
 
 async def async_get_config_entry_diagnostics(
@@ -19,6 +21,7 @@ async def async_get_config_entry_diagnostics(
     sensors = entry.options.get(CONF_SENSORS, [])
     light = entry.options.get(CONF_LIGHT)
     switch_device = entry.options.get(CONF_SWITCH_DEVICE)
+    coordinator: ZoneCoordinator | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
 
     def _state(entity_id: str) -> dict:
         state = hass.states.get(entity_id)
@@ -29,6 +32,23 @@ async def async_get_config_entry_diagnostics(
             "attributes": dict(state.attributes),
             "last_changed": state.last_changed.isoformat(),
         }
+
+    hw_timeouts = {}
+    light_on_time_floor = None
+    light_on_time_sec = None
+    if coordinator is not None:
+        for entity_id in sensors:
+            info = coordinator.sensor_hw_timeout_info(entity_id)
+            source_entity_id = info.get("source_entity_id")
+            hw_timeouts[entity_id] = {
+                "stored_baseline_sec": info.get("timeout_sec"),
+                "live_value_sec": coordinator.sensor_hw_timeout(entity_id),
+                "source": info.get("source"),
+                "source_entity_id": source_entity_id,
+                "source_state": _state(source_entity_id) if source_entity_id else None,
+            }
+        light_on_time_floor = coordinator.max_sensor_hw_timeout()
+        light_on_time_sec = coordinator.light_on_time_sec
 
     return {
         "zone": {
@@ -45,4 +65,7 @@ async def async_get_config_entry_diagnostics(
             "sensors": {entity_id: _state(entity_id) for entity_id in sensors},
             "light": _state(light) if light else None,
         },
+        "hw_timeouts": hw_timeouts,
+        "light_on_time_floor": light_on_time_floor,
+        "light_on_time_sec": light_on_time_sec,
     }

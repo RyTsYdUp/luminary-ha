@@ -15,6 +15,7 @@ from homeassistant.helpers.event import (
 
 from .const import (
     CONF_SENSORS,
+    CONF_SENSOR_HW_TIMEOUTS,
     CONF_LIGHT,
     CONF_SWITCH_DEVICE,
     CONF_ZONE_ID,
@@ -47,6 +48,13 @@ class ZoneCoordinator:
         # Entity references set by platforms after entity creation
         self.motion_group_entity = None
         self.status_entity = None
+        self.light_on_time_entity = None
+        # Hardware-timeout tracking: sensor_entity_id -> its display entity, and
+        # source_entity_id (the Configuration CC / Z2M number entity) -> sensor_entity_id.
+        # No cached values live here — sensor_hw_timeout() always reads through to the
+        # source entity's current state; Z-Wave JS / Z2M own that value, not Luminary.
+        self._hw_timeout_entities: dict = {}
+        self._hw_timeout_source_map: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Config accessors
@@ -160,6 +168,44 @@ class ZoneCoordinator:
     @property
     def lux_sensor_entity(self) -> str:
         return self._state(self.eid("text", "lux_sensor_entity")) or ""
+
+    # ------------------------------------------------------------------
+    # Hardware motion-clear-timeout (read-through; Z-Wave JS / Z2M own the value)
+    # ------------------------------------------------------------------
+
+    def sensor_hw_timeout_info(self, sensor_entity_id: str) -> dict:
+        return self.entry.options.get(CONF_SENSOR_HW_TIMEOUTS, {}).get(sensor_entity_id, {})
+
+    def sensor_hw_timeout(self, sensor_entity_id: str) -> float | None:
+        """Return sensor_entity_id's onboard hardware clear-timeout, or None if unknown.
+
+        Manually-entered values (no source_entity_id) come straight from entry.options.
+        Auto-detected values are always read live from the source entity's current
+        state — never cached — since the owning integration (zwave_js/mqtt) is the
+        source of truth, not Luminary.
+        """
+        info = self.sensor_hw_timeout_info(sensor_entity_id)
+        if not info:
+            return None
+        source_entity_id = info.get("source_entity_id")
+        if source_entity_id is None:
+            timeout_sec = info.get("timeout_sec")
+            return float(timeout_sec) if timeout_sec is not None else None
+        return self._float_or_none(source_entity_id)
+
+    def _float_or_none(self, entity_id: str) -> float | None:
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            return float(state.state)
+        except (ValueError, TypeError):
+            return None
+
+    def max_sensor_hw_timeout(self) -> float:
+        """Return the largest known hardware timeout across this zone's sensors, or 0."""
+        values = [self.sensor_hw_timeout(sid) for sid in self.sensors]
+        return max((v for v in values if v is not None), default=0.0)
 
     # ------------------------------------------------------------------
     # Logic helpers
@@ -313,6 +359,12 @@ class ZoneCoordinator:
             unsub = async_track_state_change_event(
                 self.hass, self.sensors, _on_change
             )
+            # Race guard: sensors may have cleared between the _sensors_any_on
+            # check in the caller and listener registration here.  The callback
+            # won't fire for a transition that already happened, so seed the
+            # event manually if sensors are already off.
+            if not any(self.hass.states.is_state(s, "on") for s in self.sensors):
+                cleared.set()
             stuck = False
             try:
                 await asyncio.wait_for(cleared.wait(), timeout=self._stuck_timeout)
@@ -497,6 +549,66 @@ class ZoneCoordinator:
             )
 
     # ------------------------------------------------------------------
+    # Hardware timeout live updates
+    # ------------------------------------------------------------------
+
+    @callback
+    def _handle_hw_timeout_source_changed(self, event: Event) -> None:
+        """A tracked Configuration CC / Z2M timeout entity changed state.
+
+        Luminary doesn't own this value (see sensor_hw_timeout()) — this just
+        re-renders the affected entities and re-checks the light_on_time_sec floor.
+        """
+        source_entity_id = event.data.get("entity_id")
+        sensor_entity_id = self._hw_timeout_source_map.get(source_entity_id)
+        if sensor_entity_id is None:
+            return
+        display_entity = self._hw_timeout_entities.get(sensor_entity_id)
+        if display_entity is not None:
+            display_entity.async_write_ha_state()
+        if self.light_on_time_entity is not None:
+            self.light_on_time_entity.async_write_ha_state()
+        self.hass.async_create_task(self._maybe_bump_light_on_time_floor())
+
+    async def _maybe_bump_light_on_time_floor(self) -> None:
+        """If the hardware-timeout floor now exceeds light_on_time_sec, raise it and notify.
+
+        Runs both on live source-entity changes and once at startup (an existing zone's
+        light_on_time_sec may already sit below the floor after this feature is first
+        confirmed, or after the user lowers it manually).
+        """
+        if self.light_on_time_entity is None:
+            return
+        floor = self.max_sensor_hw_timeout()
+        current = self.light_on_time_sec
+        if floor <= current:
+            return
+        driving_sensor = next(
+            (sid for sid in self.sensors if self.sensor_hw_timeout(sid) == floor), None
+        )
+        self.light_on_time_entity._attr_native_value = floor
+        self.light_on_time_entity.async_write_ha_state()
+        sensor_state = self.hass.states.get(driving_sensor) if driving_sensor else None
+        sensor_name = (
+            sensor_state.attributes.get("friendly_name")
+            if sensor_state
+            else driving_sensor or "A motion sensor"
+        )
+        await self.hass.services.async_call(
+            "persistent_notification", "create",
+            {
+                "notification_id": f"{self.zone_id}_light_on_time_floor",
+                "title": f"{self.zone_name}: post-motion delay raised to {int(floor)}s",
+                "message": (
+                    f"{sensor_name} has a hardware clear timeout of {int(floor)}s, longer than "
+                    f"the previously configured {int(current)}s post-motion delay. Raised "
+                    "automatically to prevent light flicker."
+                ),
+            },
+            blocking=False,
+        )
+
+    # ------------------------------------------------------------------
     # Status sensor invalidation
     # ------------------------------------------------------------------
 
@@ -530,6 +642,24 @@ class ZoneCoordinator:
             self.hass.states.is_state(s, "on") for s in self.sensors
         )
 
+        # Hardware-timeout live tracking: watch each confirmed sensor's source entity
+        # (Configuration CC / Z2M number entity) so the floor stays current without
+        # Luminary caching the value itself.
+        hw_timeouts = self.entry.options.get(CONF_SENSOR_HW_TIMEOUTS, {})
+        self._hw_timeout_source_map = {
+            info["source_entity_id"]: sensor_entity_id
+            for sensor_entity_id, info in hw_timeouts.items()
+            if info.get("source_entity_id")
+        }
+        if self._hw_timeout_source_map:
+            self._unsub_listeners.append(
+                async_track_state_change_event(
+                    self.hass,
+                    list(self._hw_timeout_source_map),
+                    self._handle_hw_timeout_source_changed,
+                )
+            )
+
     @callback
     def async_register_entity_listeners(self) -> None:
         """Register state-change listeners for own entities.
@@ -558,6 +688,10 @@ class ZoneCoordinator:
                 self._handle_dim_time_entity_changed,
             )
         )
+        # Startup floor check: an existing zone's light_on_time_sec may already sit
+        # below the hardware-timeout floor (first confirm-timeout run after upgrade,
+        # or the user lowered it manually since the last check).
+        self.hass.async_create_task(self._maybe_bump_light_on_time_floor())
 
     async def async_unload(self) -> None:
         """Remove all listeners and cancel running tasks."""
