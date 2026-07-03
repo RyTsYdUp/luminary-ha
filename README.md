@@ -1,5 +1,7 @@
 # luminary-ha
 
+![Luminary HA logo](docs/images/logo.png)
+
 A Home Assistant custom integration for configurable motion-activated lighting in multi-sensor zones. Set it up once via the UI — no YAML required after that.
 
 ## Features
