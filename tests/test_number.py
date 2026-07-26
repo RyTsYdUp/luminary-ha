@@ -9,6 +9,7 @@ from tests.test_coordinator import SENSOR_1, SENSOR_2, _make_entry, _make_hass
 
 LIGHT_ON_TIME_DESC = next(d for d in NUMBERS if d.key == "light_on_time_sec")
 NORMAL_BRIGHTNESS_DESC = next(d for d in NUMBERS if d.key == "normal_brightness")
+STALE_SENSOR_MINUTES_DESC = next(d for d in NUMBERS if d.key == "stale_sensor_minutes")
 
 
 def _coord(hw_timeouts: dict | None = None) -> ZoneCoordinator:
@@ -47,6 +48,13 @@ def test_min_value_takes_max_across_sensors():
     })
     entity = LuminaryNumber(coord, LIGHT_ON_TIME_DESC)
     assert entity.native_min_value == 45.0
+
+
+def test_stale_sensor_minutes_default_and_bounds():
+    entity = LuminaryNumber(_coord(), STALE_SENSOR_MINUTES_DESC)
+    assert entity._attr_native_value == 60
+    assert STALE_SENSOR_MINUTES_DESC.native_min_value == 10
+    assert STALE_SENSOR_MINUTES_DESC.native_max_value == 1440
 
 
 def test_unrelated_number_entity_ignores_sensor_floor():

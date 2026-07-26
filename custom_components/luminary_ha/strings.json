@@ -95,6 +95,9 @@
       },
       "normal_brightness": {
         "name": "Normal Brightness"
+      },
+      "stale_sensor_minutes": {
+        "name": "Stale Sensor Alert Threshold"
       }
     },
     "select": {

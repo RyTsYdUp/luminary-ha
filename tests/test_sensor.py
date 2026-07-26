@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 from custom_components.luminary_ha import sensor as sensor_module
 from custom_components.luminary_ha.const import CONF_SENSOR_HW_TIMEOUTS, DOMAIN
 from custom_components.luminary_ha.coordinator import ZoneCoordinator
-from custom_components.luminary_ha.sensor import LuminaryMotionHwTimeoutSensor
+from custom_components.luminary_ha.sensor import LuminaryMotionHwTimeoutSensor, LuminaryMotionLastSeenSensor
 
 from tests.test_coordinator import SENSOR_1, SENSOR_2, _make_entry, _make_hass
 
@@ -62,7 +63,39 @@ def test_async_setup_entry_creates_one_entity_per_sensor():
     added = []
     asyncio.run(sensor_module.async_setup_entry(hass, entry, lambda entities: added.extend(entities)))
 
-    # 1 status sensor + 2 hw-timeout sensors (SENSOR_1, SENSOR_2)
-    assert len(added) == 3
+    # 1 status sensor + 2 hw-timeout sensors + 2 last-seen sensors (SENSOR_1, SENSOR_2)
+    assert len(added) == 5
     assert coord.status_entity is not None
     assert set(coord._hw_timeout_entities.keys()) == {SENSOR_1, SENSOR_2}
+    assert set(coord.last_seen_entities.keys()) == {SENSOR_1, SENSOR_2}
+
+
+# ---------------------------------------------------------------------------
+# LuminaryMotionLastSeenSensor
+# ---------------------------------------------------------------------------
+
+def test_last_seen_native_value_reads_through_coordinator():
+    coord = ZoneCoordinator(_make_hass(), _make_entry())
+    ts = datetime(2026, 7, 17, 15, 54, 5, tzinfo=timezone.utc)
+    coord._last_seen_source_map = {SENSOR_1: "sensor.src_last_seen"}
+    coord.hass.states.put("sensor.src_last_seen", ts.isoformat())
+    entity = LuminaryMotionLastSeenSensor(coord, SENSOR_1)
+
+    assert entity.native_value == ts
+    assert entity.monitored_sensor == SENSOR_1
+
+
+def test_last_seen_native_value_none_when_undetected():
+    coord = ZoneCoordinator(_make_hass(), _make_entry())
+    entity = LuminaryMotionLastSeenSensor(coord, SENSOR_1)
+    assert entity.native_value is None
+
+
+def test_last_seen_unique_id_and_name_derived_from_sensor():
+    coord = ZoneCoordinator(_make_hass(), _make_entry())
+    coord.hass.states.put(SENSOR_1, "off", {"friendly_name": "Test Hallway Sensor"})
+    entity = LuminaryMotionLastSeenSensor(coord, SENSOR_1)
+
+    assert entity._attr_name == "Test Hallway Sensor Last Seen"
+    assert entity._attr_unique_id.startswith(coord.entry.entry_id)
+    assert "last_seen" in entity._attr_unique_id

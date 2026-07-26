@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant, callback, Event
@@ -11,8 +11,11 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
+    async_track_time_interval,
 )
+from homeassistant.util import slugify
 
+from . import hw_timeout
 from .const import (
     CONF_SENSORS,
     CONF_SENSOR_HW_TIMEOUTS,
@@ -22,7 +25,9 @@ from .const import (
     CONF_ZONE_NAME,
     CONF_AREA,
     DAYTIME_MODE_SUN,
+    DEFAULT_STALE_SENSOR_MINUTES,
     DOMAIN,
+    STALE_CHECK_INTERVAL_SEC,
     ZWAVE_SCENE_VALUE_SINGLE,
     ZWAVE_SCENE_VALUE_DOUBLE,
     ZWAVE_SCENE_KEY_UP,
@@ -55,6 +60,12 @@ class ZoneCoordinator:
         # source entity's current state; Z-Wave JS / Z2M own that value, not Luminary.
         self._hw_timeout_entities: dict = {}
         self._hw_timeout_source_map: dict[str, str] = {}
+        # Dead/stuck-sensor detection via last_seen staleness (see const.py comment
+        # and hw_timeout.async_detect_last_seen). Discovered once at startup;
+        # sensor_last_seen() always reads through to the source entity's live state.
+        self._last_seen_source_map: dict[str, str] = {}
+        self._stale_notified: set[str] = set()
+        self.last_seen_entities: dict = {}
 
     # ------------------------------------------------------------------
     # Config accessors
@@ -208,6 +219,36 @@ class ZoneCoordinator:
         return max((v for v in values if v is not None), default=0.0)
 
     # ------------------------------------------------------------------
+    # Dead/stuck-sensor detection (read-through; see const.py comment)
+    # ------------------------------------------------------------------
+
+    def sensor_last_seen(self, sensor_entity_id: str) -> datetime | None:
+        """Live-read sensor_entity_id's last-communicated timestamp, or None if
+        undiscovered/unavailable. Never cached — same read-through philosophy as
+        sensor_hw_timeout(); the owning integration owns this value, not Luminary."""
+        source_entity_id = self._last_seen_source_map.get(sensor_entity_id)
+        if source_entity_id is None:
+            return None
+        state = self.hass.states.get(source_entity_id)
+        if state is None or state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            return datetime.fromisoformat(state.state)
+        except (ValueError, TypeError):
+            return None
+
+    def sensor_stale_seconds(self, sensor_entity_id: str) -> float | None:
+        """Seconds since sensor_entity_id last communicated, or None if unknown."""
+        last_seen = self.sensor_last_seen(sensor_entity_id)
+        if last_seen is None:
+            return None
+        return (datetime.now(timezone.utc) - last_seen).total_seconds()
+
+    @property
+    def stale_sensor_threshold_sec(self) -> float:
+        return self._float(self.eid("number", "stale_sensor_minutes"), DEFAULT_STALE_SENSOR_MINUTES) * 60
+
+    # ------------------------------------------------------------------
     # Logic helpers
     # ------------------------------------------------------------------
 
@@ -294,10 +335,38 @@ class ZoneCoordinator:
             blocking=False,
         )
 
-    async def _set_switch(self, service: str, entity_id: str) -> None:
+    async def _set_switch(self, service: str, entity_id: str, blocking: bool = False) -> None:
         await self.hass.services.async_call(
-            "switch", service, {"entity_id": entity_id}, blocking=False
+            "switch", service, {"entity_id": entity_id}, blocking=blocking
         )
+
+    # ------------------------------------------------------------------
+    # Light state enforcement (window brightness applies no matter how the
+    # light was turned on — motion, physical paddle tap, or another
+    # integration entirely)
+    # ------------------------------------------------------------------
+
+    @callback
+    def _handle_light_change(self, event: Event) -> None:
+        """Re-assert the correct dim/normal brightness on any off->on report.
+
+        Z-Wave dimmers restore their own last-remembered level on a plain
+        physical tap, independent of anything Luminary commanded — that
+        level can be stale (e.g. left over from the last nightlight-window
+        use) and won't match the window we're actually in right now.
+        """
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state != "on":
+            return
+        if self.automation_disabled or self.motion_blocker:
+            return
+
+        target = self.target_brightness()
+        brightness = new_state.attributes.get("brightness")
+        current_pct = round(brightness / 255 * 100) if brightness is not None else None
+        if current_pct is not None and abs(current_pct - target) <= 1:
+            return
+        self.hass.async_create_task(self._light_on(target))
 
     # ------------------------------------------------------------------
     # Motion sequence (automations 1 + 10)
@@ -430,9 +499,11 @@ class ZoneCoordinator:
 
     async def _single_tap_up(self) -> None:
         """Full bright + manual override (smart) or plain on (dumb)."""
-        await self._light_on(100)
         if not self.automation_disabled:
-            await self._set_switch("turn_on", self.eid("switch", "motion_blocker"))
+            # Set the override flag first (blocking) so the window-enforcement
+            # listener sees it before reacting to the light's on-state report.
+            await self._set_switch("turn_on", self.eid("switch", "motion_blocker"), blocking=True)
+        await self._light_on(100)
 
     async def _single_tap_down(self) -> None:
         """Return to auto (smart) or plain off (dumb)."""
@@ -549,6 +620,56 @@ class ZoneCoordinator:
             )
 
     # ------------------------------------------------------------------
+    # Dead/stuck-sensor detection (last_seen staleness — see const.py comment)
+    # ------------------------------------------------------------------
+
+    @callback
+    def _check_stale_sensors(self, now: datetime) -> None:
+        """Periodic poll — staleness is an absence of updates, so it can't be caught
+        by a state-change listener; something has to actively check the clock."""
+        for sensor_entity_id in self.sensors:
+            display_entity = self.last_seen_entities.get(sensor_entity_id)
+            if display_entity is not None:
+                display_entity.async_write_ha_state()
+
+            stale_seconds = self.sensor_stale_seconds(sensor_entity_id)
+            is_stale = stale_seconds is not None and stale_seconds > self.stale_sensor_threshold_sec
+            was_notified = sensor_entity_id in self._stale_notified
+
+            if is_stale and not was_notified:
+                self._stale_notified.add(sensor_entity_id)
+                self.hass.async_create_task(self._notify_sensor_stale(sensor_entity_id, stale_seconds))
+            elif not is_stale and was_notified:
+                self._stale_notified.discard(sensor_entity_id)
+                self.hass.async_create_task(self._clear_sensor_stale(sensor_entity_id))
+
+    async def _notify_sensor_stale(self, sensor_entity_id: str, stale_seconds: float) -> None:
+        state = self.hass.states.get(sensor_entity_id)
+        name = state.attributes.get("friendly_name") if state else sensor_entity_id
+        minutes = int(stale_seconds // 60)
+        await self.hass.services.async_call(
+            "persistent_notification", "create",
+            {
+                "notification_id": f"{self.zone_id}_sensor_stale_{slugify(sensor_entity_id)}",
+                "title": f"{self.zone_name}: Motion Sensor May Be Dead",
+                "message": (
+                    f"{name} hasn't reported anything in {minutes} minutes — far longer "
+                    "than normal, even for a sleeping battery sensor. Motion detection "
+                    "here may be degraded even though the sensor's own state doesn't "
+                    "show unavailable. Check its battery."
+                ),
+            },
+            blocking=False,
+        )
+
+    async def _clear_sensor_stale(self, sensor_entity_id: str) -> None:
+        await self.hass.services.async_call(
+            "persistent_notification", "dismiss",
+            {"notification_id": f"{self.zone_id}_sensor_stale_{slugify(sensor_entity_id)}"},
+            blocking=False,
+        )
+
+    # ------------------------------------------------------------------
     # Hardware timeout live updates
     # ------------------------------------------------------------------
 
@@ -638,6 +759,12 @@ class ZoneCoordinator:
                 "zwave_js_value_notification", self._handle_zwave_event
             )
         )
+        if self.light:
+            self._unsub_listeners.append(
+                async_track_state_change_event(
+                    self.hass, [self.light], self._handle_light_change
+                )
+            )
         self._sensors_any_on = any(
             self.hass.states.is_state(s, "on") for s in self.sensors
         )
@@ -659,6 +786,20 @@ class ZoneCoordinator:
                     self._handle_hw_timeout_source_changed,
                 )
             )
+
+        # Dead/stuck-sensor detection: discover each sensor's own "last communicated"
+        # diagnostic entity, then periodically check for staleness (see const.py
+        # comment). Unlike the hw-timeout Configuration CC entities, this one is
+        # enabled by default, so no confirm-step / config-flow involvement is needed.
+        for sensor_entity_id in self.sensors:
+            result = await hw_timeout.async_detect_last_seen(self.hass, sensor_entity_id)
+            if result.ok and result.source_entity_id:
+                self._last_seen_source_map[sensor_entity_id] = result.source_entity_id
+        self._unsub_listeners.append(
+            async_track_time_interval(
+                self.hass, self._check_stale_sensors, timedelta(seconds=STALE_CHECK_INTERVAL_SEC)
+            )
+        )
 
     @callback
     def async_register_entity_listeners(self) -> None:

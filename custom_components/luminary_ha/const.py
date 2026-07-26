@@ -56,3 +56,15 @@ ZWAVE_TIMEOUT_KEYWORD_HINTS = ("timeout", "duration")  # fallback only for unmap
 # default (unlike Z-Wave Configuration entities).
 ZIGBEE2MQTT_UNIQUE_ID_SUFFIX = "_zigbee2mqtt"
 ZIGBEE2MQTT_TIMEOUT_PROPERTY_KEYS = ("occupancy_timeout",)
+
+# --- Dead/stuck-sensor detection via last_seen staleness (hw_timeout.py) ---
+#
+# Confirmed against real hardware (2026-07-25 motion-capture analysis): a Zooz ZSE11
+# with a failing battery held its binary_sensor "on" for 4+ days while never once
+# reporting "unavailable" — Z-Wave JS has no way to distinguish a dead sleeping node
+# from one between wake cycles. Its "Last Seen" diagnostic entity (enabled by default,
+# unlike Configuration CC hw-timeout entities) simply stopped advancing the moment the
+# node went silent — a far earlier and more reliable signal than either the sensor's
+# own state or an "unavailable" watch.
+DEFAULT_STALE_SENSOR_MINUTES = 60  # default notify-if-silent-longer-than threshold
+STALE_CHECK_INTERVAL_SEC = 300  # how often the coordinator re-checks last_seen age

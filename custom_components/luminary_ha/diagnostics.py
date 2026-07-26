@@ -34,6 +34,7 @@ async def async_get_config_entry_diagnostics(
         }
 
     hw_timeouts = {}
+    stale_sensors = {}
     light_on_time_floor = None
     light_on_time_sec = None
     if coordinator is not None:
@@ -46,6 +47,16 @@ async def async_get_config_entry_diagnostics(
                 "source": info.get("source"),
                 "source_entity_id": source_entity_id,
                 "source_state": _state(source_entity_id) if source_entity_id else None,
+            }
+            last_seen_source = coordinator._last_seen_source_map.get(entity_id)
+            stale_seconds = coordinator.sensor_stale_seconds(entity_id)
+            stale_sensors[entity_id] = {
+                "last_seen_source_entity_id": last_seen_source,
+                "stale_seconds": stale_seconds,
+                "threshold_seconds": coordinator.stale_sensor_threshold_sec,
+                "is_stale": (
+                    stale_seconds is not None and stale_seconds > coordinator.stale_sensor_threshold_sec
+                ),
             }
         light_on_time_floor = coordinator.max_sensor_hw_timeout()
         light_on_time_sec = coordinator.light_on_time_sec
@@ -66,6 +77,7 @@ async def async_get_config_entry_diagnostics(
             "light": _state(light) if light else None,
         },
         "hw_timeouts": hw_timeouts,
+        "stale_sensors": stale_sensors,
         "light_on_time_floor": light_on_time_floor,
         "light_on_time_sec": light_on_time_sec,
     }

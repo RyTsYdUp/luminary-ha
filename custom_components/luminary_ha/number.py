@@ -22,6 +22,7 @@ from .const import (
     DEFAULT_LIGHT_ON_TIME,
     DEFAULT_LUX_THRESHOLD,
     DEFAULT_NORMAL_BRIGHTNESS,
+    DEFAULT_STALE_SENSOR_MINUTES,
     DEFAULT_SUN_ELEVATION,
     DOMAIN,
 )
@@ -90,6 +91,16 @@ NUMBERS: tuple[LuminaryNumberDescription, ...] = (
         native_max_value=100,
         native_step=1,
         default=DEFAULT_NORMAL_BRIGHTNESS,
+    ),
+    LuminaryNumberDescription(
+        key="stale_sensor_minutes",
+        translation_key="stale_sensor_minutes",
+        icon="mdi:clock-alert-outline",
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+        native_min_value=10,
+        native_max_value=1440,
+        native_step=5,
+        default=DEFAULT_STALE_SENSOR_MINUTES,
     ),
 )
 

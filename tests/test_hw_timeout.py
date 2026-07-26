@@ -191,3 +191,112 @@ async def test_async_detect_all_aggregates():
 
     assert set(results.keys()) == {sensor_a, sensor_b}
     assert all(r.reason == "unsupported_platform" for r in results.values())
+
+
+# ---------------------------------------------------------------------------
+# async_detect_last_seen
+# ---------------------------------------------------------------------------
+
+async def test_last_seen_zwave_hit():
+    ent_reg, dev_reg = make_fake_registries()
+    ent_reg.add(FakeRegistryEntry(SENSOR, unique_id="4246878805.48-113-0-x", platform="zwave_js", device_id="dev1"))
+    ent_reg.add(FakeRegistryEntry("sensor.pantry_motion_last_seen", unique_id="4246878805.48-x-last-seen",
+                                   platform="zwave_js", device_id="dev1"))
+    dev_reg.add(FakeDeviceEntry("dev1", manufacturer="Zooz", model="ZSE11"))
+    hass = _make_hass({"sensor.pantry_motion_last_seen": "2026-07-13T12:28:08+00:00"})
+
+    p1, p2 = _patched(ent_reg, dev_reg)
+    with p1, p2:
+        result = await hw_timeout.async_detect_last_seen(hass, SENSOR)
+
+    assert result.ok is True
+    assert result.source == "zwave"
+    assert result.source_entity_id == "sensor.pantry_motion_last_seen"
+
+
+async def test_last_seen_zigbee2mqtt_hit():
+    ent_reg, dev_reg = make_fake_registries()
+    z2m_sensor = "binary_sensor.laundry_room_motion_occupancy"
+    ent_reg.add(FakeRegistryEntry(z2m_sensor, unique_id="0xabc_occupancy_zigbee2mqtt", platform="mqtt",
+                                   device_id="dev2"))
+    ent_reg.add(FakeRegistryEntry("sensor.laundry_room_motion_last_seen", unique_id="0xabc_last_seen_zigbee2mqtt",
+                                   platform="mqtt", device_id="dev2"))
+    dev_reg.add(FakeDeviceEntry("dev2", manufacturer="Philips", model="Hue motion sensor"))
+    hass = _make_hass({"sensor.laundry_room_motion_last_seen": "2026-07-04T09:00:00+00:00"})
+
+    p1, p2 = _patched(ent_reg, dev_reg)
+    with p1, p2:
+        result = await hw_timeout.async_detect_last_seen(hass, z2m_sensor)
+
+    assert result.ok is True
+    assert result.source == "zigbee2mqtt"
+    assert result.source_entity_id == "sensor.laundry_room_motion_last_seen"
+
+
+async def test_last_seen_value_unavailable():
+    ent_reg, dev_reg = make_fake_registries()
+    ent_reg.add(FakeRegistryEntry(SENSOR, unique_id="4246878805.48-113-0-x", platform="zwave_js", device_id="dev1"))
+    ent_reg.add(FakeRegistryEntry("sensor.pantry_motion_last_seen", unique_id="4246878805.48-x-last-seen",
+                                   platform="zwave_js", device_id="dev1"))
+    dev_reg.add(FakeDeviceEntry("dev1", manufacturer="Zooz", model="ZSE11"))
+    hass = _make_hass({})  # no state at all
+
+    p1, p2 = _patched(ent_reg, dev_reg)
+    with p1, p2:
+        result = await hw_timeout.async_detect_last_seen(hass, SENSOR)
+
+    assert result.ok is False
+    assert result.reason == "value_unavailable"
+    assert result.source_entity_id == "sensor.pantry_motion_last_seen"
+
+
+async def test_last_seen_no_matching_sibling():
+    ent_reg, dev_reg = make_fake_registries()
+    ent_reg.add(FakeRegistryEntry(SENSOR, unique_id="123.9-113-0-x", platform="zwave_js", device_id="dev1"))
+    ent_reg.add(FakeRegistryEntry("sensor.pantry_motion_battery", unique_id="123.9-battery", platform="zwave_js",
+                                   device_id="dev1"))
+    dev_reg.add(FakeDeviceEntry("dev1", manufacturer="Zooz", model="ZSE11"))
+    hass = _make_hass({"sensor.pantry_motion_battery": "80"})
+
+    p1, p2 = _patched(ent_reg, dev_reg)
+    with p1, p2:
+        result = await hw_timeout.async_detect_last_seen(hass, SENSOR)
+
+    assert result.ok is False
+    assert result.reason == "no_matching_parameter"
+
+
+async def test_last_seen_unsupported_platform():
+    ent_reg, dev_reg = make_fake_registries()
+    ent_reg.add(FakeRegistryEntry(SENSOR, unique_id="x", platform="template", device_id="dev4"))
+    dev_reg.add(FakeDeviceEntry("dev4"))
+
+    p1, p2 = _patched(ent_reg, dev_reg)
+    with p1, p2:
+        result = await hw_timeout.async_detect_last_seen(_make_hass(), SENSOR)
+
+    assert result.ok is False
+    assert result.reason == "unsupported_platform"
+
+
+async def test_last_seen_missing_registry_entry():
+    ent_reg, dev_reg = make_fake_registries()  # SENSOR never added
+
+    p1, p2 = _patched(ent_reg, dev_reg)
+    with p1, p2:
+        result = await hw_timeout.async_detect_last_seen(_make_hass(), SENSOR)
+
+    assert result.ok is False
+    assert result.reason == "no_registry_entry"
+
+
+async def test_last_seen_missing_device_id():
+    ent_reg, dev_reg = make_fake_registries()
+    ent_reg.add(FakeRegistryEntry(SENSOR, unique_id="x", platform="zwave_js", device_id=None))
+
+    p1, p2 = _patched(ent_reg, dev_reg)
+    with p1, p2:
+        result = await hw_timeout.async_detect_last_seen(_make_hass(), SENSOR)
+
+    assert result.ok is False
+    assert result.reason == "no_device"

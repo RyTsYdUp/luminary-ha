@@ -9,6 +9,7 @@ live-read side of this.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
 from homeassistant.helpers import device_registry as dr
@@ -190,3 +191,66 @@ async def async_detect_all(
     hass: "HomeAssistant", sensor_entity_ids: list[str]
 ) -> dict[str, DetectionResult]:
     return {sid: await async_detect_hw_timeout(hass, sid) for sid in sensor_entity_ids}
+
+
+# ---------------------------------------------------------------------------
+# "Last seen" discovery — for dead/stuck-sensor detection via communication
+# staleness rather than the sensor's own reported state (see const.py comment).
+# ---------------------------------------------------------------------------
+
+
+def _find_last_seen_entity(siblings: list) -> object | None:
+    """Match a sensor's own "last communicated" diagnostic sibling.
+
+    Confirmed naming convention against real hardware: Z-Wave JS's "Last Seen" entity
+    is `sensor.<node>_last_seen`. No Zigbee2MQTT equivalent has been confirmed against
+    real hardware in this house yet — the suffix check is generic enough to catch one
+    if the naming convention matches, but treat that path as unverified.
+    """
+    for entry in siblings:
+        if entry.entity_id.startswith("sensor.") and entry.entity_id.endswith("_last_seen"):
+            return entry
+    return None
+
+
+def _read_timestamp_state(hass: "HomeAssistant", entity_id: str) -> datetime | None:
+    state = hass.states.get(entity_id)
+    if state is None or state.state in ("unknown", "unavailable"):
+        return None
+    try:
+        return datetime.fromisoformat(state.state)
+    except (ValueError, TypeError):
+        return None
+
+
+async def async_detect_last_seen(hass: "HomeAssistant", sensor_entity_id: str) -> DetectionResult:
+    """Detect sensor_entity_id's "last communicated" diagnostic sibling, if any.
+
+    Unlike hw-timeout Configuration CC entities, Z-Wave JS's Last Seen sensor is
+    enabled by default — no user confirmation step needed before Luminary can read a
+    live value, unlike sensor_hw_timeout()'s confirm_timeout config-flow step.
+    """
+    ent_reg = er.async_get(hass)
+    entry = ent_reg.async_get(sensor_entity_id)
+    if entry is None:
+        return DetectionResult.failure(sensor_entity_id, "no_registry_entry")
+
+    device_id = entry.device_id
+    if device_id is None:
+        return DetectionResult.failure(sensor_entity_id, "no_device")
+
+    if entry.platform not in ("zwave_js", "mqtt"):
+        return DetectionResult.failure(sensor_entity_id, "unsupported_platform")
+
+    siblings = er.async_entries_for_device(ent_reg, device_id, include_disabled_entities=True)
+    match = _find_last_seen_entity(siblings)
+    if match is None:
+        return DetectionResult.failure(sensor_entity_id, "no_matching_parameter")
+
+    source: DetectionSource = "zwave" if entry.platform == "zwave_js" else "zigbee2mqtt"
+    ts = _read_timestamp_state(hass, match.entity_id)
+    if ts is None:
+        return DetectionResult.failure(
+            sensor_entity_id, "value_unavailable", source=source, source_entity_id=match.entity_id
+        )
+    return DetectionResult.success(sensor_entity_id, ts.timestamp(), source, match.entity_id)

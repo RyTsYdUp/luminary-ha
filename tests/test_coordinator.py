@@ -585,7 +585,7 @@ class TestZwaveSwitchHandlers:
         coord.hass.services.async_call.assert_any_call(
             "switch", "turn_on",
             {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
-            blocking=False,
+            blocking=True,
         )
 
     async def test_36_single_tap_up_dumb_mode(self, coord, states):
@@ -813,3 +813,84 @@ class TestMotionGroup:
             "old_state": _s("off"),
         }))
         mock_entity.async_write_ha_state.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 56–63  Light window enforcement (_handle_light_change)
+#
+# Covers the "physical tap restores a stale remembered brightness" case:
+# whatever turned the light on, the reported brightness must match the
+# window (dim inside, normal outside) or get corrected.
+# ---------------------------------------------------------------------------
+
+class TestLightChangeEnforcement:
+
+    def _in_window(self):
+        return patch(
+            "custom_components.luminary_ha.coordinator.datetime",
+            **{"now.return_value": datetime(2026, 1, 1, 2, 0)},  # inside 00:00-06:00
+        )
+
+    def _outside_window(self):
+        return patch(
+            "custom_components.luminary_ha.coordinator.datetime",
+            **{"now.return_value": datetime(2026, 1, 1, 16, 13)},  # outside 00:00-06:00
+        )
+
+    def test_56_new_state_none_is_noop(self, coord):
+        coord._handle_light_change(Event({"new_state": None}))
+        coord.hass.services.async_call.assert_not_called()
+
+    def test_57_light_turning_off_is_noop(self, coord):
+        coord._handle_light_change(Event({"new_state": _s("off")}))
+        coord.hass.services.async_call.assert_not_called()
+
+    def test_58_automation_disabled_is_noop(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
+        coord.hass.services.async_call.assert_not_called()
+
+    def test_59_manual_override_is_noop(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_motion_blocker", "on")
+        coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
+        coord.hass.services.async_call.assert_not_called()
+
+    async def test_60_in_window_matching_dim_brightness_is_noop(self, coord):
+        with self._in_window():
+            # 26/255 -> 10.2% rounds to 10, matching dim_brightness default
+            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 26})}))
+            await asyncio.sleep(0)
+        coord.hass.services.async_call.assert_not_called()
+
+    async def test_61_in_window_stale_bright_gets_corrected_to_dim(self, coord):
+        with self._in_window():
+            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
+            await asyncio.sleep(0)
+        coord.hass.services.async_call.assert_called_once()
+        call_kwargs = coord.hass.services.async_call.call_args
+        assert call_kwargs.args[:2] == ("light", "turn_on")
+        assert call_kwargs.args[2]["brightness_pct"] == 10  # dim_brightness default
+
+    async def test_62_outside_window_matching_normal_brightness_is_noop(self, coord):
+        with self._outside_window():
+            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
+            await asyncio.sleep(0)
+        coord.hass.services.async_call.assert_not_called()
+
+    async def test_63_outside_window_stale_dim_gets_corrected_to_normal(self, coord):
+        with self._outside_window():
+            # brightness left over from an earlier nightlight-window use
+            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 3})}))
+            await asyncio.sleep(0)
+        coord.hass.services.async_call.assert_called_once()
+        call_kwargs = coord.hass.services.async_call.call_args
+        assert call_kwargs.args[:2] == ("light", "turn_on")
+        assert call_kwargs.args[2]["brightness_pct"] == 100  # normal_brightness default
+
+    async def test_64_missing_brightness_attribute_gets_corrected(self, coord):
+        with self._outside_window():
+            coord._handle_light_change(Event({"new_state": _s("on", {})}))
+            await asyncio.sleep(0)
+        coord.hass.services.async_call.assert_called_once()
+        call_kwargs = coord.hass.services.async_call.call_args
+        assert call_kwargs.args[2]["brightness_pct"] == 100
