@@ -63,6 +63,20 @@ The package is designed for Z-Wave switches with 3 central scenes:
 
 On 2-scene switches, scene 003 automation can be removed or repurposed.
 
+## Window brightness enforcement (not just Luminary's own actions)
+
+Early versions only applied `target_brightness()` (dim-in-window / normal-outside) through paths Luminary itself triggered — motion, its own tap handlers, the dim-window boundary crossings. A physical switch tap that doesn't fire a recognized Central Scene event, or any other integration changing the light, was invisible to that logic. Confirmed live: a Zooz dimmer restoring its own last-remembered level (a stale nightlight-window brightness) on a plain physical tap left the light at 1% in the middle of the afternoon.
+
+Fixed by listening on the light entity itself for any off→on report and correcting brightness to match the current window regardless of cause, with a 1% tolerance to avoid fighting rounding and a no-op when `automation_disabled`/`motion_blocker` are active so it doesn't undo an intentional manual override.
+
+## Dead-sensor detection via last_seen, not sensor state or "unavailable"
+
+A sensor's own binary on/off state can't tell you the sensor is dead — a node that stops communicating simply holds its last reported value. Real-hardware analysis (three weeks of house-wide motion capture) found a sensor held "on" for over four days after its battery died, and Z-Wave JS never marked it "unavailable" during that whole window — so watching for `unavailable` (the existing sensor-unavailable alert) is not a sufficient failure signal on its own.
+
+The reliable signal turned out to be the sensor's own **last communicated** diagnostic entity (Z-Wave JS's "Last Seen"; a Zigbee2MQTT equivalent is supported by the same naming-convention lookup but unconfirmed against real hardware). Because staleness is an absence of updates, it can't be caught by a state-change listener — something has to poll the clock, so this runs on a 5-minute interval rather than event-driven like the rest of the coordinator.
+
+One caveat found in production: this "Last Seen" entity is sometimes disabled by default by the owning integration, same as the Configuration CC entities behind hardware-timeout detection — Luminary deliberately doesn't auto-enable it (would need to reload the underlying integration just to activate one entity), so detection silently no-ops for a sensor until the user enables it once.
+
 ## Multi-room usage
 
 Each room instance requires a unique `ZONE` prefix. All entity IDs, automation IDs, and script IDs are namespaced under this prefix, so multiple instances coexist without conflict. Use `scripts/setup.sh` to generate room-specific files.

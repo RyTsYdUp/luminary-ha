@@ -10,6 +10,8 @@ A Home Assistant custom integration for configurable motion-activated lighting i
 - **Configurable light-on time** — maximum seconds to wait for sensors to clear; acts as a safety cutoff if a sensor gets stuck
 - **Stuck-sensor recovery** — when lights time out with sensors still on, polls Z-Wave JS to force a fresh state report
 - **Sensor unavailable alerts** — persistent HA notification when any sensor goes offline
+- **Dead-sensor detection** — persistent HA notification when a sensor stops communicating for too long, even if it never reports "unavailable" (a failing battery can hold a sensor's last state indefinitely without HA ever flagging it — see below)
+- **Window brightness enforcement** — corrects the light back to the current day/night brightness on any off→on report, not just ones Luminary itself commanded (covers physical switch taps and stale remembered dimmer levels)
 - **Day/night brightness profiles** — separate brightness levels for a configurable nightlight window
 - **Daytime detection** — optional; suppress the automation during daylight via sun elevation or a lux sensor
 - **Live configuration** — all settings are native HA entities (sliders, switches, time pickers) on the device page; no YAML edits needed
@@ -68,6 +70,7 @@ All settings are on the device page under the **Configuration** section. Changes
 | **Nightlight Brightness** | % brightness during nightlight window |
 | **Normal Brightness** | % brightness outside nightlight window |
 | **Light On Time** | Max seconds to wait for sensors to clear (see note below) |
+| **Stale Sensor Alert Threshold** | Minutes of silence from a sensor before it's flagged as possibly dead. Default 60 min. |
 
 ### Controls
 
@@ -101,6 +104,12 @@ Most Z-Wave motion sensors have a built-in **re-trigger timeout** (e.g. paramete
 4. Lights stay off until the sensor finally clears and someone moves again.
 
 **Rule of thumb:** sensor onboard timeout + 30–60 seconds padding. For a ZSE11 with parameter 13 = 30 s, use 60–90 s minimum.
+
+## Dead-Sensor Detection
+
+A motion sensor's binary on/off state isn't a reliable signal that the sensor is working — a battery-powered Z-Wave/Zigbee sensor that stops communicating entirely (dead battery, radio failure) simply holds its last reported state forever. HA has no way to distinguish that from a sensor legitimately idle between reports, so it never marks the sensor "unavailable" either.
+
+Luminary instead watches each sensor's own **last communicated** diagnostic entity (Z-Wave JS's "Last Seen", or the Zigbee2MQTT equivalent where available) and fires a notification if a sensor goes silent longer than the **Stale Sensor Alert Threshold**. This entity is sometimes disabled by default by the owning integration — if a sensor's "Last Seen" display reads "unknown" on the Luminary device page, enable the underlying sensor once under **Settings → Devices & Services → Entities** to activate detection for it.
 
 ## Dim Window and Midnight Crossing
 
