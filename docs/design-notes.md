@@ -58,16 +58,24 @@ Scene 3 (config/middle button on most Zooz switches) clears both override flags 
 
 The package is designed for Z-Wave switches with 3 central scenes:
 - Scene 001 (up paddle): single tap = manual on, double tap = disable automation
-- Scene 002 (down paddle): single tap = return to auto, double tap = re-enable automation
+- Scene 002 (down paddle): single tap = manual off, double tap = re-enable automation
 - Scene 003 (config/middle): single tap = panic reset
 
 On 2-scene switches, scene 003 automation can be removed or repurposed.
+
+## Single tap down now always turns the light off
+
+Originally single tap down cleared the manual-override flag and, if any sensor was still reporting motion, called straight into the motion sequence instead of turning the light off — the idea being that "down" while still present in the room meant "hand control back to auto," not "off." In practice this meant a down-press in a room with any lingering motion (a hallway is rarely motion-free for more than a few seconds) looked like it did nothing: the light stayed on, immediately re-lit by the motion path this same press had just triggered.
+
+Confirmed against a real switch: pressed down once, motion sensors were still active, light stayed on with no visible response. Fixed by making single tap down mirror single tap up — set the manual-override flag first (blocking, so the motion listener sees it before reacting), then unconditionally turn the light off, regardless of `_sensors_any_on`. "Return to auto" as a single-tap gesture is gone; double tap down already covers that (clears both override flags and resumes normal motion handling), so it remains the one explicit way back to automatic mode.
 
 ## Window brightness enforcement (not just Luminary's own actions)
 
 Early versions only applied `target_brightness()` (dim-in-window / normal-outside) through paths Luminary itself triggered — motion, its own tap handlers, the dim-window boundary crossings. A physical switch tap that doesn't fire a recognized Central Scene event, or any other integration changing the light, was invisible to that logic. Confirmed live: a Zooz dimmer restoring its own last-remembered level (a stale nightlight-window brightness) on a plain physical tap left the light at 1% in the middle of the afternoon.
 
 Fixed by listening on the light entity itself for any off→on report and correcting brightness to match the current window regardless of cause, with a 1% tolerance to avoid fighting rounding and a no-op when `automation_disabled`/`motion_blocker` are active so it doesn't undo an intentional manual override.
+
+**Follow-up (found via a real 3-way circuit):** this listener didn't check `is_dark_enough()`. A companion switch wired for 3-way operation on the same circuit can toggle the light on without going through this device's own Central Scene events at all — so a broad-daylight on from the companion switch was getting pushed straight to full brightness, even though the sun-elevation gate correctly blocks the *motion*-triggered path in the same conditions. Root-caused by reconstructing the sequence from the recorder DB and the Z-Wave JS log: no Central Scene event, no manual-override toggle, but a `light.turn_on` service call with the exact `brightness_pct`/`transition` signature this listener produces — timed right after a live sun-elevation check confirmed daytime (~28°, well past the 3° threshold). Added the same `is_dark_enough()` gate here that the motion path already had, so a daytime on from anything outside Luminary is left as-is instead of being forced bright.
 
 ## Dead-sensor detection via last_seen, not sensor state or "unavailable"
 

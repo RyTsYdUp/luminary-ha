@@ -354,11 +354,19 @@ class ZoneCoordinator:
         physical tap, independent of anything Luminary commanded — that
         level can be stale (e.g. left over from the last nightlight-window
         use) and won't match the window we're actually in right now.
+
+        Also covers a 3-way companion switch on the same circuit: it can
+        turn the light on without going through this device's own Central
+        Scene events at all. Gated by is_dark_enough() so a daytime on from
+        the companion switch is left alone instead of being pushed to full
+        brightness.
         """
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state != "on":
             return
         if self.automation_disabled or self.motion_blocker:
+            return
+        if not self.is_dark_enough():
             return
 
         target = self.target_brightness()
@@ -506,15 +514,21 @@ class ZoneCoordinator:
         await self._light_on(100)
 
     async def _single_tap_down(self) -> None:
-        """Return to auto (smart) or plain off (dumb)."""
-        if self.automation_disabled:
-            await self._light_off()
-            return
-        await self._set_switch("turn_off", self.eid("switch", "motion_blocker"))
-        if self._sensors_any_on:
-            self._restart_motion_task()
-        else:
-            await self._light_off()
+        """Full off + manual override (smart) or plain off (dumb).
+
+        Always turns the light off immediately, mirroring _single_tap_up.
+        Previously this released the override and, if motion was still
+        active, handed control back to the motion sequence instead of
+        actually turning off — so a down-press during active motion looked
+        like it did nothing. Setting the override first (blocking) keeps
+        the motion listener from re-lighting it out from under this call.
+        Double-tap down remains the explicit "resume automation" gesture.
+        """
+        if not self.automation_disabled:
+            # Set the override flag first (blocking) so the motion listener
+            # sees it before reacting to the light's off-state report.
+            await self._set_switch("turn_on", self.eid("switch", "motion_blocker"), blocking=True)
+        await self._light_off()
 
     async def _double_tap_up(self) -> None:
         """Enable dumb mode; preserve light state."""

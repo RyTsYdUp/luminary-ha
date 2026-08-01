@@ -603,30 +603,33 @@ class TestZwaveSwitchHandlers:
         ]
         assert len(blocker_calls) == 0
 
-    async def test_37_single_tap_down_smart_sensors_on(self, coord, states):
-        """Smart + sensors on: release override and restart motion task (not light off)."""
+    async def test_37_single_tap_down_smart_mode(self, coord, states):
+        """Smart mode: light off + enable manual override."""
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        await coord._single_tap_down()
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_off",
+            {"entity_id": LIGHT, "transition": 1},
+            blocking=False,
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_on",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=True,
+        )
+
+    async def test_38_single_tap_down_smart_sensors_still_on(self, coord, states):
+        """Smart mode + active motion: still turns off immediately (regression
+        guard — previously this handed control back to the motion sequence
+        instead of turning off, so a down-press during motion did nothing)."""
         states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
         coord._sensors_any_on = True
         coord._restart_motion_task = MagicMock()
         await coord._single_tap_down()
         coord.hass.services.async_call.assert_any_call(
-            "switch", "turn_off",
-            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
-            blocking=False,
-        )
-        coord._restart_motion_task.assert_called_once()
-        # light off must NOT be called when resuming via motion task
-        off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
-        assert len(off_calls) == 0
-
-    async def test_38_single_tap_down_smart_sensors_off(self, coord, states):
-        """Smart + sensors off: release override, light off."""
-        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
-        coord._sensors_any_on = False
-        await coord._single_tap_down()
-        coord.hass.services.async_call.assert_any_call(
             "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
         )
+        coord._restart_motion_task.assert_not_called()
 
     async def test_39_single_tap_down_dumb_mode(self, coord, states):
         """Dumb mode: just turn light off."""
@@ -816,7 +819,7 @@ class TestMotionGroup:
 
 
 # ---------------------------------------------------------------------------
-# 56–63  Light window enforcement (_handle_light_change)
+# 56–65  Light window enforcement (_handle_light_change)
 #
 # Covers the "physical tap restores a stale remembered brightness" case:
 # whatever turned the light on, the reported brightness must match the
@@ -862,7 +865,8 @@ class TestLightChangeEnforcement:
             await asyncio.sleep(0)
         coord.hass.services.async_call.assert_not_called()
 
-    async def test_61_in_window_stale_bright_gets_corrected_to_dim(self, coord):
+    async def test_61_in_window_stale_bright_gets_corrected_to_dim(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
         with self._in_window():
             coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
             await asyncio.sleep(0)
@@ -871,13 +875,15 @@ class TestLightChangeEnforcement:
         assert call_kwargs.args[:2] == ("light", "turn_on")
         assert call_kwargs.args[2]["brightness_pct"] == 10  # dim_brightness default
 
-    async def test_62_outside_window_matching_normal_brightness_is_noop(self, coord):
+    async def test_62_outside_window_matching_normal_brightness_is_noop(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
         with self._outside_window():
             coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
             await asyncio.sleep(0)
         coord.hass.services.async_call.assert_not_called()
 
-    async def test_63_outside_window_stale_dim_gets_corrected_to_normal(self, coord):
+    async def test_63_outside_window_stale_dim_gets_corrected_to_normal(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
         with self._outside_window():
             # brightness left over from an earlier nightlight-window use
             coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 3})}))
@@ -887,10 +893,22 @@ class TestLightChangeEnforcement:
         assert call_kwargs.args[:2] == ("light", "turn_on")
         assert call_kwargs.args[2]["brightness_pct"] == 100  # normal_brightness default
 
-    async def test_64_missing_brightness_attribute_gets_corrected(self, coord):
+    async def test_64_missing_brightness_attribute_gets_corrected(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
         with self._outside_window():
             coord._handle_light_change(Event({"new_state": _s("on", {})}))
             await asyncio.sleep(0)
         coord.hass.services.async_call.assert_called_once()
         call_kwargs = coord.hass.services.async_call.call_args
         assert call_kwargs.args[2]["brightness_pct"] == 100
+
+    async def test_65_daytime_not_dark_enough_is_noop_despite_stale_brightness(self, coord, states):
+        """A companion switch (or anything else) turning the light on during
+        the day must not get pushed to full/dim brightness — only genuine
+        dark-enough conditions re-assert brightness."""
+        states.put("sun.sun", "above_horizon", {"elevation": 27.7})  # well above default 3.0 threshold
+        with self._outside_window():
+            # stale brightness that would otherwise trigger a correction
+            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 3})}))
+            await asyncio.sleep(0)
+        coord.hass.services.async_call.assert_not_called()

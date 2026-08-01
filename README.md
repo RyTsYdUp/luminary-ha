@@ -11,13 +11,13 @@ A Home Assistant custom integration for configurable motion-activated lighting i
 - **Stuck-sensor recovery** — when lights time out with sensors still on, polls Z-Wave JS to force a fresh state report
 - **Sensor unavailable alerts** — persistent HA notification when any sensor goes offline
 - **Dead-sensor detection** — persistent HA notification when a sensor stops communicating for too long, even if it never reports "unavailable" (a failing battery can hold a sensor's last state indefinitely without HA ever flagging it — see below)
-- **Window brightness enforcement** — corrects the light back to the current day/night brightness on any off→on report, not just ones Luminary itself commanded (covers physical switch taps and stale remembered dimmer levels)
+- **Window brightness enforcement** — corrects the light back to the current day/night brightness on any off→on report, not just ones Luminary itself commanded (covers physical switch taps, a 3-way companion switch on the same circuit, and stale remembered dimmer levels); respects Daytime Detection, so a daytime on from outside Luminary is left alone instead of being forced bright
 - **Day/night brightness profiles** — separate brightness levels for a configurable nightlight window
 - **Daytime detection** — optional; suppress the automation during daylight via sun elevation or a lux sensor
 - **Live configuration** — all settings are native HA entities (sliders, switches, time pickers) on the device page; no YAML edits needed
 - **Three switch modes** via Z-Wave central scene (command class 91):
   - Single tap up: manual full-bright override
-  - Single tap down: return to automatic mode
+  - Single tap down: manual off override
   - Double tap up: disable all automation (dumb switch mode)
   - Double tap down: re-enable automation
   - Scene 3 press: panic reset — clears all overrides, turns light off
@@ -85,7 +85,7 @@ All settings are on the device page under the **Configuration** section. Changes
 | Action | When automation enabled | When dumb mode active |
 |---|---|---|
 | Single tap up | Full bright + manual override on | Turn light on |
-| Single tap down | Return to auto (time-appropriate brightness) | Turn light off |
+| Single tap down | Light off + manual override on | Turn light off |
 | Double tap up | Enable dumb mode | — (already in dumb mode) |
 | Double tap down | — (already enabled) | Re-enable automation |
 | Scene 3 press | Reset all overrides, lights off | Reset all overrides |
