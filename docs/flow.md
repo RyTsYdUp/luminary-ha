@@ -145,10 +145,10 @@ flowchart TD
 
     S2 --> V2{"KeyPressed\nor KeyPressed2x?"}
     V2 -- "KeyPressed — single tap" --> V2A{"automation\ndisabled?"}
-    V2A -- "No — smart mode" --> V2B["motion_blocker OFF"]
-    V2B --> V2C{"Any sensor ON?"}
-    V2C -- Yes --> V2D["Restart motion sequence\n(time-appropriate brightness)"]
-    V2C -- No --> V2E["Light OFF"]
+    V2A -- "No — smart mode" --> V2B["Set motion_blocker ON\n(blocking — closes the same-instant\nsensor-flap race)"]
+    V2B --> V2C["Cancel any in-progress\nmotion task"]
+    V2C --> V2D["Light OFF"]
+    V2D --> V2E["Set motion_blocker OFF\n(blocking — momentary suppression only,\nnot a persistent override)"]
     V2A -- "Yes — dumb mode" --> V2F["Light OFF\nplain off"]
     V2 -- "KeyPressed2x — double tap" --> V2G["automation_disabled OFF\nmotion_blocker OFF\nexit dumb mode"]
     V2G --> V2H{"Any sensor ON?"}
@@ -157,6 +157,8 @@ flowchart TD
 
     S3 --> V3["automation_disabled OFF\nmotion_blocker OFF\nLight OFF\npanic reset"]
 ```
+
+**Single-tap-down history:** originally (pre-2026-08-01) this cleared `motion_blocker` unconditionally and, if any sensor was still on, restarted the motion sequence instead of turning the light off — looked like a no-op during active motion. The 2026-08-01 fix set `motion_blocker` ON before the light-off call and left it there, which closed that race but introduced a worse regression: *every* tap-down permanently latched "Manual Override," silently blocking all future motion. Found in production within a day (pantry zone). The diagram above reflects the 2026-08-02 fix — the flag is set only for the duration of the off-command (still closes the original race) and explicitly cleared right after, so it's a momentary suppression rather than a persistent override.
 
 ---
 

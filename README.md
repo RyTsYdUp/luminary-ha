@@ -17,7 +17,7 @@ A Home Assistant custom integration for configurable motion-activated lighting i
 - **Live configuration** — all settings are native HA entities (sliders, switches, time pickers) on the device page; no YAML edits needed
 - **Three switch modes** via Z-Wave central scene (command class 91):
   - Single tap up: manual full-bright override
-  - Single tap down: manual off override
+  - Single tap down: turn light off (momentary — doesn't stay in override; motion resumes normally on the next trigger)
   - Double tap up: disable all automation (dumb switch mode)
   - Double tap down: re-enable automation
   - Scene 3 press: panic reset — clears all overrides, turns light off
@@ -84,8 +84,8 @@ All settings are on the device page under the **Configuration** section. Changes
 
 | Action | When automation enabled | When dumb mode active |
 |---|---|---|
-| Single tap up | Full bright + manual override on | Turn light on |
-| Single tap down | Light off + manual override on | Turn light off |
+| Single tap up | Full bright + manual override on (persists until double tap) | Turn light on |
+| Single tap down | Light off; override engaged only for the instant of the off-command, then cleared — motion resumes normally afterward | Turn light off |
 | Double tap up | Enable dumb mode | — (already in dumb mode) |
 | Double tap down | — (already enabled) | Re-enable automation |
 | Scene 3 press | Reset all overrides, lights off | Reset all overrides |
