@@ -56,8 +56,8 @@ Z-Wave event filtering
   34. Event for wrong command_class             → no handler called
 
 Z-Wave switch handlers
-  35. Single tap ↑, smart mode                 → light 100% + blocker on
-  36. Single tap ↑, dumb mode                  → light 100%, blocker unchanged
+  35. Single tap ↑, smart mode                 → delegates to _start_switch_on_hold
+  36. Single tap ↑, dumb mode                  → light on at normal_brightness, no blocker/hold
   37. Single tap ↓, smart mode, sensors on     → blocker off, light on at auto brightness
   38. Single tap ↓, smart mode, sensors off    → blocker off, light off
   39. Single tap ↓, dumb mode                  → light off
@@ -83,13 +83,33 @@ Motion group state
   53. Any sensor "on"                          → _sensors_any_on = True
   54. All sensors "off"                        → _sensors_any_on = False
   55. State change updates motion_group_entity
+
+Light-change dispatch (_handle_light_change) — 2026-08-02 auto-shutoff feature
+  56. new_state None                            → no dispatch
+  57. Light turning off                         → no dispatch
+  58. automation_disabled                       → no dispatch
+  59. Own context (self-commanded change)       → no dispatch
+  60. External on, automation enabled           → dispatches _start_switch_on_hold
+  61. External on during the day                → still dispatches (no more is_dark_enough gate)
+  62. External on while motion_blocker already on → still dispatches (renews the hold)
+  63. No context on event (defensive)           → still dispatches as external
+
+Switch-triggered on: full brightness + auto-shutoff (_start_switch_on_hold / _run_switch_on_sequence)
+  64. Smart mode                                → blocker on, light on at normal_brightness, sequence started
+  65. Dumb mode (automation_disabled)           → no-op entirely
+  66. Cancels an in-progress motion/hold task first
+  67. Sensors clear well within timeout         → light off + blocker off after light_on_time_sec grace
+  68. Sensors never clear                       → cap reached, light off anyway
+  69. Sensor re-triggers during grace period    → loops back, stays on
+  70. automation_disabled during wait           → skipped, light left alone
+  71. CancelledError propagates cleanly         → no light off
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -163,6 +183,7 @@ def _default_states() -> FakeStates:
     st.put(f"number.{ZONE_ID}_normal_brightness", "100")
     st.put(f"number.{ZONE_ID}_sun_elevation_threshold", "3.0")
     st.put(f"number.{ZONE_ID}_lux_threshold", "50")
+    st.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")
     st.put(f"select.{ZONE_ID}_daytime_mode", DAYTIME_MODE_SUN)
     st.put(f"text.{ZONE_ID}_lux_sensor_entity", "")
     st.put(f"time.{ZONE_ID}_dim_start", "00:00:00")
@@ -574,29 +595,27 @@ class TestZwaveFiltering:
 class TestZwaveSwitchHandlers:
 
     async def test_35_single_tap_up_smart_mode(self, coord, states):
-        """Smart mode: full bright + enable manual override."""
+        """Smart mode: delegates to _start_switch_on_hold (full bright, blocker
+        on, auto-shutoff sequence started) rather than doing it inline —
+        keeps a companion switch's on-report and a main-paddle tap on one
+        code path."""
         states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        coord._start_switch_on_hold = AsyncMock()
         await coord._single_tap_up()
-        coord.hass.services.async_call.assert_any_call(
-            "light", "turn_on",
-            {"entity_id": LIGHT, "brightness_pct": 100, "transition": 1},
-            blocking=False,
-        )
-        coord.hass.services.async_call.assert_any_call(
-            "switch", "turn_on",
-            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
-            blocking=True,
-        )
+        coord._start_switch_on_hold.assert_called_once()
 
     async def test_36_single_tap_up_dumb_mode(self, coord, states):
-        """Dumb mode: light on at 100% but no blocker touch."""
+        """Dumb mode: light on at normal_brightness, no blocker/hold at all."""
         states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        coord._start_switch_on_hold = AsyncMock()
         await coord._single_tap_up()
         coord.hass.services.async_call.assert_any_call(
             "light", "turn_on",
             {"entity_id": LIGHT, "brightness_pct": 100, "transition": 1},
             blocking=False,
+            context=ANY,
         )
+        coord._start_switch_on_hold.assert_not_called()
         blocker_calls = [
             c for c in coord.hass.services.async_call.call_args_list
             if "motion_blocker" in str(c)
@@ -836,96 +855,217 @@ class TestMotionGroup:
 
 
 # ---------------------------------------------------------------------------
-# 56–65  Light window enforcement (_handle_light_change)
+# 56–63  Light-change dispatch (_handle_light_change)
 #
-# Covers the "physical tap restores a stale remembered brightness" case:
-# whatever turned the light on, the reported brightness must match the
-# window (dim inside, normal outside) or get corrected.
+# 2026-08-02: a non-Central-Scene companion/add-on switch turned the hallway
+# light on at a stale ~1% nightlight level in broad daylight, and nothing
+# was watching to correct or ever turn it back off — this listener used to
+# stand down entirely whenever it wasn't dark enough. It now routes every
+# switch-triggered on (main paddle or companion) into the same full-bright,
+# auto-shutoff hold regardless of time of day; only its own previously-
+# commanded changes (tracked via context id) and Disabled mode are skipped.
+# The hold/brightness/timeout logic itself is covered separately below.
 # ---------------------------------------------------------------------------
 
-class TestLightChangeEnforcement:
-
-    def _in_window(self):
-        return patch(
-            "custom_components.luminary_ha.coordinator.datetime",
-            **{"now.return_value": datetime(2026, 1, 1, 2, 0)},  # inside 00:00-06:00
-        )
-
-    def _outside_window(self):
-        return patch(
-            "custom_components.luminary_ha.coordinator.datetime",
-            **{"now.return_value": datetime(2026, 1, 1, 16, 13)},  # outside 00:00-06:00
-        )
+class TestLightChangeDispatch:
 
     def test_56_new_state_none_is_noop(self, coord):
+        coord._start_switch_on_hold = AsyncMock()
         coord._handle_light_change(Event({"new_state": None}))
-        coord.hass.services.async_call.assert_not_called()
+        coord._start_switch_on_hold.assert_not_called()
 
     def test_57_light_turning_off_is_noop(self, coord):
+        coord._start_switch_on_hold = AsyncMock()
         coord._handle_light_change(Event({"new_state": _s("off")}))
-        coord.hass.services.async_call.assert_not_called()
+        coord._start_switch_on_hold.assert_not_called()
 
     def test_58_automation_disabled_is_noop(self, coord, states):
         states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        coord._start_switch_on_hold = AsyncMock()
         coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
-        coord.hass.services.async_call.assert_not_called()
+        coord._start_switch_on_hold.assert_not_called()
 
-    def test_59_manual_override_is_noop(self, coord, states):
+    async def test_59_own_context_is_noop(self, coord):
+        """A state change carrying the context id from our own last
+        _light_on call (motion sequence, dim-window re-assertion, our own
+        switch-hold turn-on) must not be treated as an external switch
+        press — otherwise every self-commanded on would re-trigger itself."""
+        coord._own_light_context_id = "test-ctx-1"
+        coord._start_switch_on_hold = AsyncMock()
+        fake_context = MagicMock()
+        fake_context.id = "test-ctx-1"
+        coord._handle_light_change(
+            Event({"new_state": _s("on", {"brightness": 255})}, context=fake_context)
+        )
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_not_called()
+
+    async def test_60_external_on_dispatches_hold(self, coord, states):
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+        coord._start_switch_on_hold = AsyncMock()
+        coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_called_once()
+
+    async def test_61_external_on_during_daytime_still_dispatches(self, coord, states):
+        """No more is_dark_enough() gate — a switch always means full
+        brightness, day or night (this is the exact 2026-08-02 gap: the
+        light turning on at 1% at 7:51 AM was ignored entirely before)."""
+        states.put("sun.sun", "above_horizon", {"elevation": 27.7})
+        coord._start_switch_on_hold = AsyncMock()
+        coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 3})}))
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_called_once()
+
+    async def test_62_external_on_while_blocker_already_on_still_dispatches(self, coord, states):
+        """A fresh external on-report while motion_blocker is already on
+        (an existing hold in progress) renews the hold rather than being
+        ignored — renewed switch activity should reset the auto-shutoff
+        clock, not be silently absorbed."""
         states.put(f"switch.{ZONE_ID}_motion_blocker", "on")
+        coord._start_switch_on_hold = AsyncMock()
         coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_called_once()
+
+    async def test_63_no_context_on_event_still_dispatches(self, coord):
+        """Defensive: an event with no context at all (context=None) must
+        still be treated as external, not accidentally swallowed."""
+        coord._start_switch_on_hold = AsyncMock()
+        coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}, context=None))
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 64–71  Switch-triggered on: full brightness + auto-shutoff
+# (_start_switch_on_hold / _run_switch_on_sequence)
+# ---------------------------------------------------------------------------
+
+class TestSwitchOnHold:
+
+    async def test_64_smart_mode_starts_hold(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        # Avoid actually running the long-lived sequence in this test —
+        # covered separately below.
+        coord._run_switch_on_sequence = AsyncMock()
+        await coord._start_switch_on_hold()
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_on",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=True,
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_on",
+            {"entity_id": LIGHT, "brightness_pct": 100, "transition": 1},
+            blocking=False,
+            context=ANY,
+        )
+        assert coord._motion_task is not None
+
+    async def test_65_dumb_mode_is_full_noop(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+        await coord._start_switch_on_hold()
         coord.hass.services.async_call.assert_not_called()
+        assert coord._motion_task is None
 
-    async def test_60_in_window_matching_dim_brightness_is_noop(self, coord):
-        with self._in_window():
-            # 26/255 -> 10.2% rounds to 10, matching dim_brightness default
-            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 26})}))
-            await asyncio.sleep(0)
-        coord.hass.services.async_call.assert_not_called()
+    async def test_66_cancels_in_progress_task_first(self, coord, states):
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
+        coord._run_switch_on_sequence = AsyncMock()
+        fake_task = MagicMock()
+        fake_task.done.return_value = False
+        coord._motion_task = fake_task
+        await coord._start_switch_on_hold()
+        fake_task.cancel.assert_called_once()
 
-    async def test_61_in_window_stale_bright_gets_corrected_to_dim(self, coord, states):
-        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
-        with self._in_window():
-            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
-            await asyncio.sleep(0)
-        coord.hass.services.async_call.assert_called_once()
-        call_kwargs = coord.hass.services.async_call.call_args
-        assert call_kwargs.args[:2] == ("light", "turn_on")
-        assert call_kwargs.args[2]["brightness_pct"] == 10  # dim_brightness default
+    async def test_67_sensors_clear_within_timeout_turns_off_after_grace(self, coord, states):
+        """Sensors already clear → cleared immediately, light off after the
+        light_on_time_sec grace period, blocker released."""
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")
+        states.put(SENSOR_1, "off")
+        states.put(SENSOR_2, "off")
 
-    async def test_62_outside_window_matching_normal_brightness_is_noop(self, coord, states):
-        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
-        with self._outside_window():
-            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}))
-            await asyncio.sleep(0)
-        coord.hass.services.async_call.assert_not_called()
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_switch_on_sequence()
 
-    async def test_63_outside_window_stale_dim_gets_corrected_to_normal(self, coord, states):
-        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
-        with self._outside_window():
-            # brightness left over from an earlier nightlight-window use
-            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 3})}))
-            await asyncio.sleep(0)
-        coord.hass.services.async_call.assert_called_once()
-        call_kwargs = coord.hass.services.async_call.call_args
-        assert call_kwargs.args[:2] == ("light", "turn_on")
-        assert call_kwargs.args[2]["brightness_pct"] == 100  # normal_brightness default
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+        )
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=True,
+        )
 
-    async def test_64_missing_brightness_attribute_gets_corrected(self, coord, states):
-        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
-        with self._outside_window():
-            coord._handle_light_change(Event({"new_state": _s("on", {})}))
-            await asyncio.sleep(0)
-        coord.hass.services.async_call.assert_called_once()
-        call_kwargs = coord.hass.services.async_call.call_args
-        assert call_kwargs.args[2]["brightness_pct"] == 100
+    async def test_68_never_clears_hits_cap_and_turns_off_anyway(self, coord, states):
+        """Sensors stay "on" the whole time (or a sensor is stuck) → the
+        overall switch_on_timeout_sec cap fires and the light is turned off
+        regardless — the actual point of an auto-shutoff safety net."""
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", str(0.02 / 60))  # ~1.2ms cap
+        states.put(SENSOR_1, "on")
 
-    async def test_65_daytime_not_dark_enough_is_noop_despite_stale_brightness(self, coord, states):
-        """A companion switch (or anything else) turning the light on during
-        the day must not get pushed to full/dim brightness — only genuine
-        dark-enough conditions re-assert brightness."""
-        states.put("sun.sun", "above_horizon", {"elevation": 27.7})  # well above default 3.0 threshold
-        with self._outside_window():
-            # stale brightness that would otherwise trigger a correction
-            coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 3})}))
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_switch_on_sequence()
+
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+        )
+
+    async def test_69_retrigger_during_grace_period_loops_and_stays_on(self, coord, states):
+        """Sensors clear, but a new motion trigger fires again during the
+        light_on_time_sec grace sleep → loop back and wait again instead of
+        turning off out from under someone still there."""
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")
+        states.put(SENSOR_1, "off")
+        states.put(SENSOR_2, "off")
+
+        calls = {"n": 0}
+
+        def is_state_on_toggle(entity_id, state):
+            # First clear-check pass: sensors are off. During the grace-sleep
+            # re-check: report SENSOR_1 back "on" exactly once, then clear
+            # again on the loop's second pass.
+            calls["n"] += 1
+            if entity_id == SENSOR_1 and calls["n"] == 3:
+                return state == "on"
+            return False
+
+        states.is_state = is_state_on_toggle
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_switch_on_sequence()
+
+        coord.hass.services.async_call.assert_any_call(
+            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+        )
+
+    async def test_70_automation_disabled_during_wait_skips_off(self, coord, states):
+        # Sensors are already clear (defaults), so cleared.wait() resolves
+        # instantly regardless of switch_on_timeout_sec — light_on_time_sec
+        # is what actually needs to stay small here, or this real-sleeps for
+        # the full default 60s grace period.
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_switch_on_sequence()
+
+        off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
+        assert len(off_calls) == 0
+
+    async def test_71_cancelled_error_propagates(self, coord, states):
+        """Sensors already clear (defaults), so the sequence moves straight
+        to the light_on_time_sec grace sleep (default 60s) — cancelling
+        there must propagate cleanly, same pattern as the motion sequence's
+        equivalent guard."""
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            task = asyncio.ensure_future(coord._run_switch_on_sequence())
             await asyncio.sleep(0)
-        coord.hass.services.async_call.assert_not_called()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
+        assert len(off_calls) == 0

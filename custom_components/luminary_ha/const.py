@@ -68,3 +68,13 @@ ZIGBEE2MQTT_TIMEOUT_PROPERTY_KEYS = ("occupancy_timeout",)
 # own state or an "unavailable" watch.
 DEFAULT_STALE_SENSOR_MINUTES = 60  # default notify-if-silent-longer-than threshold
 STALE_CHECK_INTERVAL_SEC = 300  # how often the coordinator re-checks last_seen age
+
+# --- Switch-triggered auto-shutoff (coordinator.py _run_switch_on_sequence) ---
+#
+# 2026-08-02 hallway incident: a non-Central-Scene companion/add-on switch on the
+# same circuit turned the light on (restoring a stale dim level) with nothing
+# watching to ever turn it back off, since daytime motion automation is
+# intentionally inert. Any switch-triggered on (main paddle single-tap or a
+# companion switch) now always goes to normal_brightness and starts this timer,
+# regardless of time of day. Only Disabled (double-tap) mode is exempt.
+DEFAULT_SWITCH_ON_TIMEOUT_MINUTES = 60

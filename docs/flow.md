@@ -2,7 +2,7 @@
 
 These diagrams document the automation logic in `custom_components/luminary_ha/coordinator.py`. Useful for contributors, troubleshooters, and anyone adapting the integration for a new sensor platform.
 
-> Historical note: the project started as a YAML-only `package.yaml` (see `docs/design-notes.md`), and these diagrams described that version through 2026-06-14. The project is now a full Python custom integration — `mode: restart` automations became a cancellable `asyncio.Task`, `input_*` helpers became native HA entities, and three features (hardware-timeout auto-detection, window brightness enforcement, dead-sensor detection) were added afterward that had no YAML-era equivalent. Diagrams below reflect the current Python integration.
+> Historical note: the project started as a YAML-only `package.yaml` (see `docs/design-notes.md`), and these diagrams described that version through 2026-06-14. The project is now a full Python custom integration — `mode: restart` automations became a cancellable `asyncio.Task`, `input_*` helpers became native HA entities, and three features (hardware-timeout auto-detection, switch-triggered full-brightness + auto-shutoff, dead-sensor detection) were added afterward that had no YAML-era equivalent. Diagrams below reflect the current Python integration.
 
 ---
 
@@ -34,7 +34,7 @@ flowchart LR
         A1["Main motion sequence"]
         A2["Switch tap handlers"]
         A3["Dim window boundaries"]
-        A4["Light-change listener"]
+        A4["Switch-triggered on: dispatch\n+ full-bright auto-shutoff hold"]
         A5["Hardware-timeout floor"]
         A6["Stale-sensor poll (5 min)"]
     end
@@ -138,9 +138,10 @@ flowchart TD
 
     S1 --> V1{"KeyPressed\nor KeyPressed2x?"}
     V1 -- "KeyPressed — single tap" --> V1A{"automation\ndisabled?"}
-    V1A -- "No — smart mode" --> V1B["Set motion_blocker ON\n(blocking, before the light call —\ncloses a race with the light-change listener, §5)"]
-    V1B --> V1E["Light 100%"]
-    V1A -- "Yes — dumb mode" --> V1E
+    V1A -- "No — smart mode" --> V1B["_start_switch_on_hold:\nSet motion_blocker ON, cancel any\nin-progress task (blocking, before\nthe light call — closes a race with\nthe light-change listener, §5)"]
+    V1B --> V1E["Light on at normal_brightness\n(always full/normal — never dim)"]
+    V1E --> V1F["Start auto-shutoff sequence\n— see §5"]
+    V1A -- "Yes — dumb mode" --> V1G["Light on at normal_brightness\nplain on, no hold/blocker"]
     V1 -- "KeyPressed2x — double tap" --> V1D["automation_disabled ON\nmotion_blocker OFF\nenter dumb mode\n— light state preserved, not forced off"]
 
     S2 --> V2{"KeyPressed\nor KeyPressed2x?"}
@@ -160,6 +161,8 @@ flowchart TD
 
 **Single-tap-down history:** originally (pre-2026-08-01) this cleared `motion_blocker` unconditionally and, if any sensor was still on, restarted the motion sequence instead of turning the light off — looked like a no-op during active motion. The 2026-08-01 fix set `motion_blocker` ON before the light-off call and left it there, which closed that race but introduced a worse regression: *every* tap-down permanently latched "Manual Override," silently blocking all future motion. Found in production within a day (pantry zone). The diagram above reflects the 2026-08-02 fix — the flag is set only for the duration of the off-command (still closes the original race) and explicitly cleared right after, so it's a momentary suppression rather than a persistent override.
 
+**Single-tap-up history:** before 2026-08-02, a single tap up turned the light on at a hardcoded 100% and set `motion_blocker` ON *indefinitely* — the light stayed at full brightness until an explicit tap-down or double-tap, with no time limit. This is what let a switch-triggered on go unnoticed for hours (see §5's incident writeup) if nobody circled back to turn it off. `_single_tap_up` now delegates to the same `_start_switch_on_hold` entry point a companion switch reaches via the light-change listener — full brightness, `motion_blocker` ON, and a timed auto-shutoff sequence, not an indefinite hold. Dumb mode (`automation_disabled`) is unaffected: it still just turns the light on with no hold, no blocker, no shutoff.
+
 ---
 
 ## 4. Status Sensor State Machine
@@ -178,7 +181,7 @@ stateDiagram-v2
     Standby: Enabled but suppressed\nby sun or lux condition
 
     Override: Manual Override
-    Override: Light held at full brightness\nMotion will not auto-off
+    Override: Light held at full brightness\nMotion won't compete, but the switch-on\nauto-shutoff timer is still running (§5)
 
     Disabled: Disabled
     Disabled: No automation active\nSwitch acts as dumb light
@@ -186,11 +189,11 @@ stateDiagram-v2
     Automated --> Standby: Daytime condition met\nsun up or lux too high
     Standby --> Automated: Daytime condition cleared
 
-    Automated --> Override: Single tap UP
-    Standby --> Override: Single tap UP
+    Automated --> Override: Single tap UP\nor companion switch on (§5)
+    Standby --> Override: Single tap UP\nor companion switch on (§5)
 
-    Override --> Automated: Single tap DOWN\ndark enough
-    Override --> Standby: Single tap DOWN\ntoo bright
+    Override --> Automated: Single tap DOWN,\nor auto-shutoff elapses\n— dark enough
+    Override --> Standby: Single tap DOWN,\nor auto-shutoff elapses\n— too bright
 
     Automated --> Disabled: Double tap UP
     Standby --> Disabled: Double tap UP
@@ -202,24 +205,43 @@ stateDiagram-v2
 
 ---
 
-## 5. Window Brightness Enforcement
+## 5. Switch-Triggered On: Full Brightness + Auto-Shutoff
 
-Added 2026-07-21 after a real incident: a physical paddle tap with no Central Scene report restored a Z-Wave dimmer's stale remembered brightness (a leftover nightlight-window level) at 4pm — completely invisible to the automation, since brightness was previously only ever *applied* through Luminary's own code paths. This listener watches the light entity directly, independent of what caused the change.
+Added 2026-07-21, substantially reworked 2026-08-02. Original incident: a physical paddle tap with no Central Scene report restored a Z-Wave dimmer's stale remembered brightness (a leftover nightlight-window level) at 4pm — completely invisible to the automation, since brightness was previously only ever *applied* through Luminary's own code paths. A `_handle_light_change` listener was added that watches the light entity directly, independent of what caused the change — but it only corrected brightness when `is_dark_enough()`, so a daytime companion-switch on was left alone entirely.
+
+**2026-08-02 incident:** a non-Central-Scene 3-way companion switch on the hallway circuit turned the light on at a stale ~1% nightlight level at 7:51 AM — broad daylight, so the old daytime gate left it untouched, and daytime motion automation is itself inert, so *nothing* was watching to ever turn it back off. Confirmed via raw zwave-js-ui logs: the on-report had no accompanying Central Scene notification and no Supervision-session handshake, ruling out both the main paddle's own button and any Luminary-issued command — a companion switch was the only remaining explanation. The light stayed on at 1% for over an hour and a half until manually corrected.
+
+**Fix:** the daytime gate is gone entirely. Any switch-triggered on — main paddle single-tap (`_single_tap_up`) or a companion switch (via `_handle_light_change`) — now always goes through the same `_start_switch_on_hold` entry point: full/normal brightness regardless of time of day (nightlight dim is reserved for motion-triggered activations only), plus a timed auto-shutoff so a forgotten switch-on doesn't stay on indefinitely. Self-commanded changes are recognized by HA `Context` id (set by `_light_on`) rather than by brightness happening to match, so this doesn't fight the motion sequence's own dim-brightness calls or re-trigger itself.
 
 ```mermaid
 flowchart TD
-    LC(["Light reports OFF → ON\nany cause: physical tap, another\nintegration, or Luminary itself"])
+    LC(["Light reports OFF → ON\nany cause: physical tap, companion\nswitch, another integration, or Luminary itself"])
 
     LC --> C1{"new_state is on?"}
     C1 -- No --> STOP(["Ignore — not a turn-on"])
-    C1 -- Yes --> C2{"automation_disabled or\nmotion_blocker active?"}
-    C2 -- Yes --> STOP2(["Ignore — don't fight\nan intentional override"])
-    C2 -- No --> T["target = dim_brightness if in window\nelse normal_brightness — see §8"]
+    C1 -- Yes --> C2{"event context id ==\nour last _light_on call?"}
+    C2 -- Yes --> STOP2(["Ignore — our own commanded\nchange (motion sequence,\ndim-window, or our own hold)"])
+    C2 -- No --> C3{"automation_disabled?"}
+    C3 -- Yes --> STOP3(["Ignore — dumb mode has\nno hold/shutoff at all"])
+    C3 -- No --> HOLD["_start_switch_on_hold"]
 
-    T --> M{"Reported brightness\nwithin 1% of target?"}
-    M -- Yes --> NOOP(["No-op — already correct,\nprevents a self-trigger loop"])
-    M -- No --> COR["Corrective light.turn_on\nat target brightness"]
+    HOLD --> H1["Set motion_blocker ON\n(blocking)"]
+    H1 --> H2["Cancel any in-progress\nmotion/hold task"]
+    H2 --> H3["Light on at normal_brightness\n— always full/normal, never dim"]
+    H3 --> SEQ["_run_switch_on_sequence"]
+
+    SEQ --> W["Wait for ALL sensors OFF\n— capped by Switch On Auto-Shutoff"]
+    W --> CL{"Cleared before\nthe cap?"}
+    CL -- "No — cap reached" --> OFF
+    CL -- Yes --> GRACE["Sleep light_on_time_sec\n(same grace period as the motion sequence)"]
+    GRACE --> RETRIG{"A sensor came back\non during the grace sleep?"}
+    RETRIG -- "Yes, and cap not yet reached" --> W
+    RETRIG -- "No, or cap reached" --> DIS{"automation_disabled\nbecame on during the wait?"}
+    DIS -- Yes --> HELD(["Stop — keep light on,\ndumb mode took over"])
+    DIS -- No --> OFF["Light OFF\nmotion_blocker OFF"]
 ```
+
+**Why this needs its own loop, unlike the main motion sequence (§2):** the main sequence gets torn down and restarted fresh by every new motion trigger via `_restart_motion_task` — the `asyncio.Task` equivalent of `mode: restart`. But `motion_blocker` being ON is exactly what stops `_handle_sensor_change` from calling `_restart_motion_task` in the first place (§2, first branch) — that's the whole point of the flag. So this sequence can't rely on being externally restarted by fresh motion the way §2 does; it has to watch for re-triggers itself and loop, or a person still in the hallway would get the light cut out from under them the moment the sensors happened to all read momentarily clear.
 
 ---
 

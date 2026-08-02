@@ -19,14 +19,29 @@ def _callback(func):
 
 class _Event:
     """Minimal Event for constructing test payloads."""
-    def __init__(self, data=None):
+    def __init__(self, data=None, context=None):
         self.data = data or {}
+        self.context = context
+
+
+class _Context:
+    """Minimal Context: real HA gives every service call/event a unique id
+    so listeners can tell their own commanded changes apart from external
+    ones. A plain MagicMock() wouldn't do here — by default every call to a
+    Mock returns the *same* cached return_value, so every "new" Context
+    would compare equal to every other one and defeat that distinction."""
+    _counter = 0
+
+    def __init__(self):
+        _Context._counter += 1
+        self.id = f"test-ctx-{_Context._counter}"
 
 
 # homeassistant.core
 _core = MagicMock()
 _core.callback = _callback
 _core.Event = _Event
+_core.Context = _Context
 _core.HomeAssistant = object
 
 # homeassistant.helpers.event  –  functions are mocked per-test via patch()

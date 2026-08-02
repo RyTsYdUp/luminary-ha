@@ -98,6 +98,9 @@
       },
       "stale_sensor_minutes": {
         "name": "Stale Sensor Alert Threshold"
+      },
+      "switch_on_timeout_minutes": {
+        "name": "Switch On Auto-Shutoff"
       }
     },
     "select": {

@@ -24,6 +24,7 @@ from .const import (
     DEFAULT_NORMAL_BRIGHTNESS,
     DEFAULT_STALE_SENSOR_MINUTES,
     DEFAULT_SUN_ELEVATION,
+    DEFAULT_SWITCH_ON_TIMEOUT_MINUTES,
     DOMAIN,
 )
 from .coordinator import ZoneCoordinator
@@ -101,6 +102,16 @@ NUMBERS: tuple[LuminaryNumberDescription, ...] = (
         native_max_value=1440,
         native_step=5,
         default=DEFAULT_STALE_SENSOR_MINUTES,
+    ),
+    LuminaryNumberDescription(
+        key="switch_on_timeout_minutes",
+        translation_key="switch_on_timeout_minutes",
+        icon="mdi:timer-lock-outline",
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+        native_min_value=5,
+        native_max_value=1440,
+        native_step=5,
+        default=DEFAULT_SWITCH_ON_TIMEOUT_MINUTES,
     ),
 )
 
