@@ -604,7 +604,10 @@ class TestZwaveSwitchHandlers:
         assert len(blocker_calls) == 0
 
     async def test_37_single_tap_down_smart_mode(self, coord, states):
-        """Smart mode: light off + enable manual override."""
+        """Smart mode: light off, override held only for the duration of the
+        off-command and cleared again afterward (regression guard — a prior
+        fix left this switch permanently on, silently blocking all future
+        motion until an explicit double-tap; 2026-08-02)."""
         states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
         await coord._single_tap_down()
         coord.hass.services.async_call.assert_any_call(
@@ -617,19 +620,33 @@ class TestZwaveSwitchHandlers:
             {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
             blocking=True,
         )
+        # Must be the last motion_blocker call — i.e. cleared again, not left on.
+        blocker_calls = [
+            c for c in coord.hass.services.async_call.call_args_list
+            if c.args[:2] == ("switch", "turn_on") or c.args[:2] == ("switch", "turn_off")
+        ]
+        assert blocker_calls[-1].args[:2] == ("switch", "turn_off")
+        assert blocker_calls[-1].kwargs == {"blocking": True}
 
     async def test_38_single_tap_down_smart_sensors_still_on(self, coord, states):
         """Smart mode + active motion: still turns off immediately (regression
         guard — previously this handed control back to the motion sequence
-        instead of turning off, so a down-press during motion did nothing)."""
+        instead of turning off, so a down-press during motion did nothing).
+        Any in-progress motion task is cancelled outright rather than
+        restarted, so the off sticks until a genuinely new motion transition
+        comes in."""
         states.put(f"switch.{ZONE_ID}_automation_disabled", "off")
         coord._sensors_any_on = True
         coord._restart_motion_task = MagicMock()
+        fake_task = MagicMock()
+        fake_task.done.return_value = False
+        coord._motion_task = fake_task
         await coord._single_tap_down()
         coord.hass.services.async_call.assert_any_call(
             "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
         )
         coord._restart_motion_task.assert_not_called()
+        fake_task.cancel.assert_called_once()
 
     async def test_39_single_tap_down_dumb_mode(self, coord, states):
         """Dumb mode: just turn light off."""

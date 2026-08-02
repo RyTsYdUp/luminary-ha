@@ -514,21 +514,35 @@ class ZoneCoordinator:
         await self._light_on(100)
 
     async def _single_tap_down(self) -> None:
-        """Full off + manual override (smart) or plain off (dumb).
+        """Full off now; hand control back to automation (smart) or plain off (dumb).
 
-        Always turns the light off immediately, mirroring _single_tap_up.
-        Previously this released the override and, if motion was still
-        active, handed control back to the motion sequence instead of
-        actually turning off — so a down-press during active motion looked
-        like it did nothing. Setting the override first (blocking) keeps
-        the motion listener from re-lighting it out from under this call.
-        Double-tap down remains the explicit "resume automation" gesture.
+        Always turns the light off immediately. Previously this released
+        the override and, if motion was still active, handed control back
+        to the motion sequence instead of actually turning off — so a
+        down-press during active motion looked like it did nothing
+        (2026-08-01). The fix for that briefly engaged the override flag,
+        but never cleared it again, so it latched "Manual Override"
+        permanently and silently blocked all future motion until an
+        explicit double-tap (caught 2026-08-02 on the pantry zone).
+
+        The override flag is only held for the duration of the off-command
+        itself, to block a sensor re-trigger racing with it (e.g. flapping
+        right at the sensor's own hardware clear-timeout) from turning the
+        light back on out from under this call. It's cleared again right
+        after, so this is a momentary suppression, not a persistent
+        override — unlike _single_tap_up. Any lingering motion task from
+        before the tap is cancelled rather than restarted, so the off
+        sticks until a genuinely new motion transition comes in; double-tap
+        down remains the explicit "resume automation" gesture.
         """
-        if not self.automation_disabled:
-            # Set the override flag first (blocking) so the motion listener
-            # sees it before reacting to the light's off-state report.
-            await self._set_switch("turn_on", self.eid("switch", "motion_blocker"), blocking=True)
+        if self.automation_disabled:
+            await self._light_off()
+            return
+        await self._set_switch("turn_on", self.eid("switch", "motion_blocker"), blocking=True)
+        if self._motion_task and not self._motion_task.done():
+            self._motion_task.cancel()
         await self._light_off()
+        await self._set_switch("turn_off", self.eid("switch", "motion_blocker"), blocking=True)
 
     async def _double_tap_up(self) -> None:
         """Enable dumb mode; preserve light state."""
