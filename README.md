@@ -108,6 +108,24 @@ Most Z-Wave motion sensors have a built-in **re-trigger timeout** (e.g. paramete
 
 **Rule of thumb:** sensor onboard timeout + 30–60 seconds padding. For a ZSE11 with parameter 13 = 30 s, use 60–90 s minimum.
 
+## Switch On Hold Time vs Light On Time
+
+These two settings look similar and behave nothing alike. They govern different paths:
+
+| | **Light On Time** | **Switch On Hold Time** |
+|---|---|---|
+| Applies to | Motion-triggered activations | Switch/remote-triggered activations |
+| Unit | Seconds | Minutes |
+| Meaning | How long lights stay on *after the sensors clear* | How long lights stay on, **period** |
+| Motion during it | Resets the wait — fresh motion restarts the sequence | Ignored entirely |
+| Ends early? | Yes, implicitly — it only starts once the room is clear | No. Tap down to end it early |
+
+A switch press is an explicit request for light, so **Switch On Hold Time** is a guarantee rather than a ceiling: motion can't cut it short, and motion can't extend it either. Both halves matter. The first means you don't get dropped into darkness because you stood still long enough to look empty to a PIR — the thing that makes a motion sensor a bad judge of "is this person done." The second means a stuck sensor can't hold a zone lit indefinitely, which is what makes the end of the hold a dependable backstop for a light somebody forgot about.
+
+When the hold expires, the zone goes back to automatic control rather than simply switching off. If a sensor is active *and* the zone is dark enough to act on motion, the motion sequence takes the light over; otherwise the light turns off. That avoids cutting the light and having the sensor's next report flick it straight back on a few seconds later.
+
+Pick the duration to match how the room is used, not how long someone might linger — a walk-through corridor wants a short hold, a kitchen you cook in wants a long one.
+
 ## Dead-Sensor Detection
 
 A motion sensor's binary on/off state isn't a reliable signal that the sensor is working — a battery-powered Z-Wave/Zigbee sensor that stops communicating entirely (dead battery, radio failure) simply holds its last reported state forever. HA has no way to distinguish that from a sensor legitimately idle between reports, so it never marks the sensor "unavailable" either.
