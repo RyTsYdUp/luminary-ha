@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
@@ -13,6 +14,27 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import ZoneCoordinator
+
+# Diagnostics downloads get pasted verbatim into bug reports, and this dumps every
+# attribute of the configured sensors and light — whatever the owning integration
+# happens to put there. Redact the identifying/locating keys that commonly show up
+# on Z-Wave/Zigbee/MQTT entities; none of them are needed to debug Luminary itself.
+TO_REDACT = {
+    "latitude",
+    "longitude",
+    "gps",
+    "ip_address",
+    "mac",
+    "mac_address",
+    "serial_number",
+    "node_id",
+    "home_id",
+    "ieee",
+    "device_id",
+    "unique_id",
+    "access_token",
+    "entity_picture",
+}
 
 
 async def async_get_config_entry_diagnostics(
@@ -29,7 +51,7 @@ async def async_get_config_entry_diagnostics(
             return {"state": "unavailable"}
         return {
             "state": state.state,
-            "attributes": dict(state.attributes),
+            "attributes": async_redact_data(dict(state.attributes), TO_REDACT),
             "last_changed": state.last_changed.isoformat(),
         }
 

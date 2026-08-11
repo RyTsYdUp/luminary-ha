@@ -54,6 +54,7 @@ Motion sequence: light control
 Z-Wave event filtering
   33. Event for wrong device_id                 → no handler called
   34. Event for wrong command_class             → no handler called
+  34b. No switch device configured              → no handler called (was: accepted every device)
 
 Z-Wave switch handlers
   35. Single tap ↑, smart mode                 → delegates to _start_switch_on_hold
@@ -76,8 +77,9 @@ Dim window boundary handlers
 
 Sensor unavailable / recovery
   50. Sensor becomes unavailable               → persistent_notification created
-  51. Sensor recovers, all sensors available   → notification dismissed
-  52. Sensor recovers, another still unavailable → notification NOT dismissed
+  51. Sensor recovers                          → that sensor's notification dismissed
+  52. Notification ids are per-sensor, not per-zone (one sensor's recovery leaves
+      the others' alerts standing)
 
 Motion group state
   53. Any sensor "on"                          → _sensors_any_on = True
@@ -89,10 +91,14 @@ Light-change dispatch (_handle_light_change) — 2026-08-02 auto-shutoff feature
   57. Light turning off                         → no dispatch
   58. automation_disabled                       → no dispatch
   59. Own context (self-commanded change)       → no dispatch
+  59b. Own context behind a newer _light_on     → still no dispatch (context ring)
   60. External on, automation enabled           → dispatches _start_switch_on_hold
   61. External on during the day                → still dispatches (no more is_dark_enough gate)
   62. External on while motion_blocker already on → still dispatches (renews the hold)
   63. No context on event (defensive)           → still dispatches as external
+  63b. on → on update (attribute-only change)   → no dispatch (not a switch press)
+  63c. off → on edge                            → still dispatches (companion switch)
+  63d. unavailable → on edge                    → still dispatches
 
 Switch-triggered on: full brightness + auto-shutoff (_start_switch_on_hold / _run_switch_on_sequence)
   64. Smart mode                                → blocker on, light on at normal_brightness, sequence started
@@ -102,6 +108,8 @@ Switch-triggered on: full brightness + auto-shutoff (_start_switch_on_hold / _ru
   68. Sensors never clear                       → cap reached, light off anyway
   69. Sensor re-triggers during grace period    → loops back, stays on (event-driven, not sampled)
   70. automation_disabled during wait           → skipped, light left alone
+  70b. automation_disabled during wait          → motion_blocker still released
+  70c. Cap reached                              → motion_blocker released
   71. CancelledError propagates cleanly         → no light off
 """
 
@@ -308,6 +316,9 @@ class TestIsDarkEnough:
 # ---------------------------------------------------------------------------
 
 class TestInDimWindow:
+    """The clock is read via dt_util.now(), not datetime.now() — the window has to
+    follow the timezone configured *in HA*, not whatever the host process's clock
+    happens to be set to (2026-08-10 review)."""
 
     def _set_window(self, states, start: str, end: str):
         states.put(f"time.{ZONE_ID}_dim_start", start)
@@ -315,25 +326,25 @@ class TestInDimWindow:
 
     def test_08_simple_window_inside(self, coord, states):
         self._set_window(states, "22:00:00", "23:00:00")
-        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+        with patch("custom_components.luminary_ha.coordinator.dt_util") as mock_dt:
             mock_dt.now.return_value = datetime(2026, 1, 1, 22, 30)
             assert coord.in_dim_window() is True
 
     def test_09_simple_window_outside(self, coord, states):
         self._set_window(states, "22:00:00", "23:00:00")
-        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+        with patch("custom_components.luminary_ha.coordinator.dt_util") as mock_dt:
             mock_dt.now.return_value = datetime(2026, 1, 1, 10, 0)
             assert coord.in_dim_window() is False
 
     def test_10_midnight_crossing_inside(self, coord, states):
         self._set_window(states, "23:00:00", "06:00:00")
-        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+        with patch("custom_components.luminary_ha.coordinator.dt_util") as mock_dt:
             mock_dt.now.return_value = datetime(2026, 1, 1, 2, 0)
             assert coord.in_dim_window() is True
 
     def test_11_midnight_crossing_outside(self, coord, states):
         self._set_window(states, "23:00:00", "06:00:00")
-        with patch("custom_components.luminary_ha.coordinator.datetime") as mock_dt:
+        with patch("custom_components.luminary_ha.coordinator.dt_util") as mock_dt:
             mock_dt.now.return_value = datetime(2026, 1, 1, 12, 0)
             assert coord.in_dim_window() is False
 
@@ -587,6 +598,22 @@ class TestZwaveFiltering:
         await asyncio.sleep(0)
         coord._single_tap_up.assert_not_called()
 
+    async def test_34b_no_switch_device_configured_ignores_everything(self, coord, entry):
+        """CONF_SWITCH_DEVICE is optional, and a zone without one must handle
+        no taps at all.
+
+        The guard used to read `if self.switch_device and device_id != ...`,
+        which short-circuits to "accept" when nothing is configured — so such
+        a zone acted on Central Scene notifications from *every* Z-Wave device
+        in the house, letting any scene controller anywhere drive its lights
+        (2026-08-10 review).
+        """
+        entry.options[CONF_SWITCH_DEVICE] = None
+        coord._single_tap_up = AsyncMock()
+        coord._handle_zwave_event(_zwave_event(device_id="some_other_scene_controller"))
+        await asyncio.sleep(0)
+        coord._single_tap_up.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 35–43  Z-Wave switch handlers
@@ -790,7 +817,7 @@ class TestSensorUnavailable:
         coord.hass.services.async_call.assert_called_once_with(
             "persistent_notification", "create",
             {
-                "notification_id": f"{ZONE_ID}_sensor_unavailable",
+                "notification_id": f"{ZONE_ID}_sensor_unavailable_binary_sensor_motion_1",
                 "title": "Hallway: Motion Sensor Unavailable",
                 "message": (
                     "Hallway Motion 1 is unavailable. "
@@ -801,21 +828,34 @@ class TestSensorUnavailable:
             blocking=False,
         )
 
-    async def test_51_recovery_all_available_dismisses(self, coord, states):
+    async def test_51_recovery_dismisses_that_sensors_notification(self, coord, states):
         states.put(SENSOR_1, "off")
-        states.put(SENSOR_2, "off")
-        await coord._maybe_clear_unavailable()
+        await coord._clear_sensor_unavailable(SENSOR_1)
         coord.hass.services.async_call.assert_called_once_with(
             "persistent_notification", "dismiss",
-            {"notification_id": f"{ZONE_ID}_sensor_unavailable"},
+            {"notification_id": f"{ZONE_ID}_sensor_unavailable_binary_sensor_motion_1"},
             blocking=False,
         )
 
-    async def test_52_recovery_another_still_unavailable_keeps_notification(self, coord, states):
-        states.put(SENSOR_1, "off")
-        states.put(SENSOR_2, "unavailable")  # still bad
-        await coord._maybe_clear_unavailable()
-        coord.hass.services.async_call.assert_not_called()
+    async def test_52_notification_ids_are_per_sensor(self, coord):
+        """One notification per sensor, not per zone (2026-08-10 review).
+
+        With a single shared per-zone id, the second sensor to drop out
+        overwrote the first one's alert — so a multi-sensor zone could only
+        ever name one of them — and the first sensor to recover dismissed the
+        alert for every sensor still down.
+        """
+        await coord._notify_sensor_unavailable(SENSOR_1, _s("unavailable", {"friendly_name": "Motion 1"}))
+        await coord._notify_sensor_unavailable(SENSOR_2, _s("unavailable", {"friendly_name": "Motion 2"}))
+
+        ids = [c.args[2]["notification_id"] for c in coord.hass.services.async_call.call_args_list]
+        assert len(set(ids)) == 2
+
+        # Sensor 1 recovering leaves sensor 2's alert standing.
+        coord.hass.services.async_call.reset_mock()
+        await coord._clear_sensor_unavailable(SENSOR_1)
+        dismissed = [c.args[2]["notification_id"] for c in coord.hass.services.async_call.call_args_list]
+        assert dismissed == [f"{ZONE_ID}_sensor_unavailable_binary_sensor_motion_1"]
 
 
 # ---------------------------------------------------------------------------
@@ -886,16 +926,36 @@ class TestLightChangeDispatch:
         coord._start_switch_on_hold.assert_not_called()
 
     async def test_59_own_context_is_noop(self, coord):
-        """A state change carrying the context id from our own last
-        _light_on call (motion sequence, dim-window re-assertion, our own
+        """A state change carrying the context id from one of our own recent
+        _light_on calls (motion sequence, dim-window re-assertion, our own
         switch-hold turn-on) must not be treated as an external switch
         press — otherwise every self-commanded on would re-trigger itself."""
-        coord._own_light_context_id = "test-ctx-1"
+        coord._own_light_context_ids.append("test-ctx-1")
         coord._start_switch_on_hold = AsyncMock()
         fake_context = MagicMock()
         fake_context.id = "test-ctx-1"
         coord._handle_light_change(
             Event({"new_state": _s("on", {"brightness": 255})}, context=fake_context)
+        )
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_not_called()
+
+    async def test_59b_own_context_still_matches_behind_a_newer_light_on(self, coord):
+        """Two _light_on calls can be in flight at once — a dim-window
+        boundary landing on top of a motion trigger at 00:00. With a single
+        context slot the older call's state event arrived after the newer one
+        had overwritten it, so Luminary's own command was misread as an
+        external switch press. A ring of recent ids keeps both recognised
+        (2026-08-10 review)."""
+        coord._start_switch_on_hold = AsyncMock()
+        await coord._light_on(10)   # e.g. dim-window re-assertion
+        await coord._light_on(100)  # motion trigger right behind it
+        first_ctx_id = coord._own_light_context_ids[0]
+
+        stale_context = MagicMock()
+        stale_context.id = first_ctx_id
+        coord._handle_light_change(
+            Event({"new_state": _s("on", {"brightness": 25})}, context=stale_context)
         )
         await asyncio.sleep(0)
         coord._start_switch_on_hold.assert_not_called()
@@ -933,6 +993,47 @@ class TestLightChangeDispatch:
         still be treated as external, not accidentally swallowed."""
         coord._start_switch_on_hold = AsyncMock()
         coord._handle_light_change(Event({"new_state": _s("on", {"brightness": 255})}, context=None))
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_called_once()
+
+    async def test_63b_on_to_on_update_is_noop(self, coord):
+        """Only a real off->on edge counts as a switch press.
+
+        async_track_state_change_event also fires for attribute-only updates,
+        so without an old_state check any re-write while the light is already
+        on reads as a switch press. HA only stamps the originating context on
+        entity writes for ~5s after the service call, so a Z-Wave dimmer's
+        delayed confirming report falls outside the context check above and
+        would snap a 10% nightlight activation straight to 100% — defeating
+        nightlight dimming outright (2026-08-10 review).
+        """
+        coord._start_switch_on_hold = AsyncMock()
+        coord._handle_light_change(Event({
+            "old_state": _s("on", {"brightness": 25}),
+            "new_state": _s("on", {"brightness": 26}),
+        }))
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_not_called()
+
+    async def test_63c_off_to_on_edge_still_dispatches(self, coord):
+        """The companion-switch case the old_state guard must not break: a
+        genuine off->on from a switch is still an off->on edge."""
+        coord._start_switch_on_hold = AsyncMock()
+        coord._handle_light_change(Event({
+            "old_state": _s("off"),
+            "new_state": _s("on", {"brightness": 255}),
+        }))
+        await asyncio.sleep(0)
+        coord._start_switch_on_hold.assert_called_once()
+
+    async def test_63d_unavailable_to_on_still_dispatches(self, coord):
+        """A light coming back from unavailable already on (power restored to
+        the circuit) is also not an on->on update — still external."""
+        coord._start_switch_on_hold = AsyncMock()
+        coord._handle_light_change(Event({
+            "old_state": _s("unavailable"),
+            "new_state": _s("on", {"brightness": 255}),
+        }))
         await asyncio.sleep(0)
         coord._start_switch_on_hold.assert_called_once()
 
@@ -1068,6 +1169,44 @@ class TestSwitchOnHold:
 
         off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
         assert len(off_calls) == 0
+
+    async def test_70b_automation_disabled_during_wait_still_releases_blocker(self, coord, states):
+        """Disabled mode skips the light-off but must not skip the blocker
+        release (2026-08-10 review).
+
+        _start_switch_on_hold is the only thing that raises motion_blocker and
+        this sequence is the only thing that lowers it, so returning early
+        here latched the zone in "Manual Override" permanently — the same
+        failure class as the 2026-08-02 single-tap-down latch. Reachable by
+        flipping automation_disabled from the HA UI mid-hold; double-tap-up
+        clears the blocker itself and so never exposed it.
+        """
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_switch_on_sequence()
+
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=True,
+        )
+
+    async def test_70c_cap_reached_releases_blocker(self, coord, states):
+        """The other non-cancellation exit — the overall auto-shutoff cap —
+        must release the blocker too."""
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", str(0.02 / 60))  # ~1.2ms cap
+        states.put(SENSOR_1, "on")
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            await coord._run_switch_on_sequence()
+
+        coord.hass.services.async_call.assert_any_call(
+            "switch", "turn_off",
+            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+            blocking=True,
+        )
 
     async def test_71_cancelled_error_propagates(self, coord, states):
         """Sensors already clear (defaults), so the sequence moves straight

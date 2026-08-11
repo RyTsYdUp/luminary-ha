@@ -219,6 +219,15 @@ class ButtonEntity(_FakeEntityBase):
     pass
 
 
+@_dataclass(frozen=True, kw_only=True)
+class SwitchEntityDescription(EntityDescription):
+    pass
+
+
+class SwitchEntity(_FakeEntityBase):
+    pass
+
+
 _helpers_entity = MagicMock()
 _helpers_entity.DeviceInfo = DeviceInfo
 _helpers_entity.EntityCategory = EntityCategory
@@ -241,6 +250,29 @@ _components_sensor.SensorEntityDescription = SensorEntityDescription
 _components_button = MagicMock()
 _components_button.ButtonEntity = ButtonEntity
 _components_button.ButtonEntityDescription = ButtonEntityDescription
+
+
+def _async_redact_data(data, to_redact):
+    """Faithful stand-in for homeassistant.components.diagnostics.async_redact_data:
+    recursive, non-mutating, replaces matched keys with the REDACTED sentinel."""
+    if isinstance(data, dict):
+        return {
+            k: "**REDACTED**" if k in to_redact else _async_redact_data(v, to_redact)
+            for k, v in data.items()
+        }
+    if isinstance(data, (list, tuple)):
+        return [_async_redact_data(v, to_redact) for v in data]
+    return data
+
+
+_components_diagnostics = MagicMock()
+_components_diagnostics.async_redact_data = _async_redact_data
+sys.modules["homeassistant.components.diagnostics"] = _components_diagnostics
+
+_components_switch = MagicMock()
+_components_switch.SwitchEntity = SwitchEntity
+_components_switch.SwitchEntityDescription = SwitchEntityDescription
+sys.modules["homeassistant.components.switch"] = _components_switch
 
 _homeassistant = sys.modules.setdefault("homeassistant", MagicMock())
 sys.modules["homeassistant.core"] = _core
@@ -280,9 +312,18 @@ def _slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", text.lower()).strip("_")
 
 
+# homeassistant.util.dt — the coordinator uses dt_util.now() rather than
+# datetime.now() so the nightlight window follows HA's *configured* timezone
+# rather than the host process clock. Tests patch coordinator.dt_util directly;
+# this stub only needs to exist and be importable.
+_util_dt = MagicMock()
+_util_dt.now = MagicMock(side_effect=lambda: __import__("datetime").datetime.now())
+
 _util = MagicMock()
 _util.slugify = _slugify
+_util.dt = _util_dt
 sys.modules["homeassistant.util"] = _util
+sys.modules["homeassistant.util.dt"] = _util_dt
 
 
 # --- config_entries / area_registry fakes (for config_flow.py) ---
@@ -378,6 +419,8 @@ _components = MagicMock()
 _components.number = _components_number
 _components.sensor = _components_sensor
 _components.button = _components_button
+_components.diagnostics = _components_diagnostics
+_components.switch = _components_switch
 sys.modules["homeassistant.components"] = _components
 
 # Top-level `homeassistant` package attributes — needed for `from homeassistant import

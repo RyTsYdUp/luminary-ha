@@ -156,6 +156,19 @@ class LuminaryNumber(NumberEntity, RestoreEntity):
         return self.entity_description.native_min_value
 
     @property
+    def native_max_value(self) -> float:
+        """Keep max >= min when the hardware-timeout floor pushes past the static max.
+
+        The floor is read live and unbounded from the owning integration — a Zooz
+        ZSE11's motion timeout parameter goes to 15300s, far past light_on_time_sec's
+        static 600s ceiling. min > max breaks the number entity in the frontend and
+        rejects the value _maybe_bump_light_on_time_floor writes (2026-08-10 review).
+        """
+        if self.entity_description.dynamic_min_from_sensors:
+            return max(self.entity_description.native_max_value, self.native_min_value)
+        return self.entity_description.native_max_value
+
+    @property
     def available(self) -> bool:
         if self.entity_description.requires_nightlight and not self._coordinator.nightlight_enabled:
             return False

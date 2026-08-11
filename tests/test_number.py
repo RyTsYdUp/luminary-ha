@@ -65,6 +65,37 @@ def test_unrelated_number_entity_ignores_sensor_floor():
     assert entity.native_min_value == NORMAL_BRIGHTNESS_DESC.native_min_value == 1
 
 
+def test_max_value_static_when_floor_is_below_it():
+    coord = _coord({
+        SENSOR_1: {"timeout_sec": 30.0, "source": "manual", "source_entity_id": None},
+    })
+    entity = LuminaryNumber(coord, LIGHT_ON_TIME_DESC)
+    assert entity.native_max_value == 600
+
+
+def test_max_value_rises_with_a_floor_past_the_static_ceiling():
+    """The hardware-timeout floor is read live and unbounded from the owning
+    integration — a Zooz ZSE11's motion timeout parameter reaches 15300s, far
+    past light_on_time_sec's static 600s ceiling. min > max breaks the number
+    entity in the frontend and rejects the value _maybe_bump_light_on_time_floor
+    writes, so the ceiling has to follow the floor up (2026-08-10 review)."""
+    coord = _coord({
+        SENSOR_1: {"timeout_sec": 900.0, "source": "manual", "source_entity_id": None},
+    })
+    entity = LuminaryNumber(coord, LIGHT_ON_TIME_DESC)
+    assert entity.native_min_value == 900.0
+    assert entity.native_max_value == 900.0
+    assert entity.native_max_value >= entity.native_min_value
+
+
+def test_unrelated_number_entity_keeps_static_max():
+    coord = _coord({
+        SENSOR_1: {"timeout_sec": 9999.0, "source": "manual", "source_entity_id": None},
+    })
+    entity = LuminaryNumber(coord, NORMAL_BRIGHTNESS_DESC)
+    assert entity.native_max_value == NORMAL_BRIGHTNESS_DESC.native_max_value == 100
+
+
 def test_async_setup_entry_registers_light_on_time_entity():
     import asyncio
     from custom_components.luminary_ha import number as number_module

@@ -16,6 +16,7 @@ from .coordinator import ZoneCoordinator
 @dataclass(frozen=True, kw_only=True)
 class LuminarySwitchDescription(SwitchEntityDescription):
     default_on: bool = False
+    restore: bool = True
 
 
 SWITCHES: tuple[LuminarySwitchDescription, ...] = (
@@ -31,11 +32,20 @@ SWITCHES: tuple[LuminarySwitchDescription, ...] = (
         icon="mdi:weather-night",
         default_on=True,
     ),
+    # Deliberately not restored across restarts. motion_blocker is transient
+    # state owned by a running sequence: _start_switch_on_hold raises it and
+    # _run_switch_on_sequence lowers it again. async_unload cancels that task,
+    # so restoring "on" after a restart or integration reload resurrects the
+    # flag with nothing alive to ever clear it — the zone sits in permanent
+    # "Manual Override" and ignores all motion (2026-08-10 review; same latch
+    # class as the 2026-08-02 single-tap-down bug). Starting off fails open to
+    # working automation, which is the safe direction for a lighting zone.
     LuminarySwitchDescription(
         key="motion_blocker",
         translation_key="motion_blocker",
         icon="mdi:hand-back-right",
         default_on=False,
+        restore=False,
     ),
     LuminarySwitchDescription(
         key="automation_disabled",
@@ -75,6 +85,8 @@ class LuminarySwitch(SwitchEntity, RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        if not self.entity_description.restore:
+            return
         if (last := await self.async_get_last_state()) is not None:
             self._attr_is_on = last.state == "on"
 

@@ -23,8 +23,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        coordinator: ZoneCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        await coordinator.async_unload()
+        # .pop with a default: a setup that failed part-way never registered a
+        # coordinator, and a bare pop would raise KeyError and mask the real error.
+        coordinator: ZoneCoordinator | None = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        if coordinator is not None:
+            await coordinator.async_unload()
     return unload_ok
 
 

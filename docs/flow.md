@@ -219,7 +219,9 @@ flowchart TD
 
     LC --> C1{"new_state is on?"}
     C1 -- No --> STOP(["Ignore — not a turn-on"])
-    C1 -- Yes --> C2{"event context id ==\nour last _light_on call?"}
+    C1 -- Yes --> C1B{"old_state was\nalready on?"}
+    C1B -- Yes --> STOP1B(["Ignore — attribute-only update,\nnot an off → on edge"])
+    C1B -- No --> C2{"event context id in\nour recent _light_on calls?"}
     C2 -- Yes --> STOP2(["Ignore — our own commanded\nchange (motion sequence,\ndim-window, or our own hold)"])
     C2 -- No --> C3{"automation_disabled?"}
     C3 -- Yes --> STOP3(["Ignore — dumb mode has\nno hold/shutoff at all"])
@@ -237,11 +239,21 @@ flowchart TD
     GRACE --> RETRIG{"A sensor turned on\nduring that window?"}
     RETRIG -- "Yes, and cap not yet reached" --> W
     RETRIG -- "No — window elapsed clear,\nor cap reached" --> DIS{"automation_disabled\nbecame on during the wait?"}
-    DIS -- Yes --> HELD(["Stop — keep light on,\ndumb mode took over"])
-    DIS -- No --> OFF["Light OFF\nmotion_blocker OFF"]
+    DIS -- Yes --> HELD["Keep light on —\ndumb mode took over"]
+    DIS -- No --> OFF["Light OFF"]
+    HELD --> REL["motion_blocker OFF\n— released on every non-cancelled\nexit, see 2026-08-10 review"]
+    OFF --> REL
 ```
 
 **Why this needs its own loop, unlike the main motion sequence (§2):** the main sequence gets torn down and restarted fresh by every new motion trigger via `_restart_motion_task` — the `asyncio.Task` equivalent of `mode: restart`. But `motion_blocker` being ON is exactly what stops `_handle_sensor_change` from calling `_restart_motion_task` in the first place (§2, first branch) — that's the whole point of the flag. So this sequence can't rely on being externally restarted by fresh motion the way §2 does; it has to watch for re-triggers itself and loop, or a person still in the hallway would get the light cut out from under them the moment the sensors happened to all read momentarily clear.
+
+**2026-08-10 review — three defects in this path.** Found by reading rather than by an incident, so none has a confirmed production sighting; all three are fixed and covered by tests.
+
+1. **`_handle_light_change` had no off→on edge check.** The `LC` node has always *said* "reports OFF → ON", but the code only tested `new_state`. `async_track_state_change_event` also fires for attribute-only updates, so any re-write while the light was already on — a Z-Wave dimmer's delayed confirming report, another integration touching the entity — read as a switch press and drove the zone to full brightness. HA carries the originating `Context` on entity writes for only ~5s after the service call, so a slower device report also falls outside the `C2` check; that 5s window is the only reason nightlight dimming survived this at all. The `C1B` node above is the fix.
+
+2. **`motion_blocker` could latch permanently.** `_start_switch_on_hold` is the only thing that raises the flag and `_run_switch_on_sequence` is the only thing that lowers it, so any exit that skipped the release stranded the zone in "Manual Override" — the same failure the single-tap-down handler had on 2026-08-02. Two such exits existed: the `DIS` branch returned early (reachable by flipping `automation_disabled` from the HA UI mid-hold; double-tap-up clears the flag itself and so never exposed it), and an HA restart or integration reload mid-hold restored the flag from state with the owning task already cancelled. Now only the light-off is conditional on Disabled mode — the release is not (`REL` above) — and `motion_blocker` no longer restores across restarts, since it is transient state owned by a running sequence rather than a user preference.
+
+3. **A zone with no switch device accepted every Z-Wave scene event in the house.** `_handle_zwave_event`'s filter read `if self.switch_device and device_id != self.switch_device: return`, which short-circuits to "accept" when `CONF_SWITCH_DEVICE` — an optional field — is unset. Any scene controller anywhere could drive such a zone's taps. No configured switch now means no tap handling at all.
 
 **2026-08-10 incident (kitchen):** the grace-period check originally slept `light_on_time_sec` blind, then sampled sensor state *once*, at that exact instant, to decide `RETRIG`. Sensors with a short onboard hardware clear-timeout (10s — see §6, true of every sensor in every zone) report brief off-blips during continuous real occupancy, so a single instantaneous sample could land mid-blip and wrongly conclude the room was empty. Confirmed via the kitchen zone's history: cabinet lights kept getting shut off 2–11 minutes into a cooking session, well under the configured 60-minute cap, while the motion sensor was still actively cycling throughout. **Fix:** `GRACE` now watches for any new on-event over the *entire* window via a tracked state-change listener (an `asyncio.Event`, not a sleep-then-sample), giving this loop the same continuous-clear guarantee `_restart_motion_task` already gives §2. The cap and the always-full-brightness/always-eventually-off-regardless-of-daytime behavior above are unchanged.
 

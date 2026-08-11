@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,7 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.util import slugify
+from homeassistant.util import dt as dt_util
 
 from . import hw_timeout
 from .const import (
@@ -51,12 +53,18 @@ class ZoneCoordinator:
         self._dim_unsubs: list = []
         self._motion_task: asyncio.Task | None = None
         self._sensors_any_on: bool = False
-        # Context id of the last light.turn_on call Luminary itself issued, so
+        # Context ids of recent light.turn_on calls Luminary itself issued, so
         # _handle_light_change can tell its own commanded changes (motion
         # sequence, dim-window re-assertion, switch-hold) apart from a
         # genuinely external one (switch/companion switch, another
         # integration) without relying on brightness happening to match.
-        self._own_light_context_id: str | None = None
+        #
+        # A ring of recent ids rather than a single slot: two _light_on calls
+        # can be in flight at once (a dim-window boundary landing on top of a
+        # motion trigger at 00:00), and with one slot the first call's state
+        # event arrives after the second has overwritten it — misreading
+        # Luminary's own command as an external switch press.
+        self._own_light_context_ids: deque[str] = deque(maxlen=8)
         # Entity references set by platforms after entity creation
         self.motion_group_entity = None
         self.status_entity = None
@@ -120,7 +128,10 @@ class ZoneCoordinator:
             )
             if isinstance(entity_id, str):
                 return entity_id
-        except Exception:
+        except (KeyError, AttributeError):
+            # Registry not available yet (pre-setup, or under test stubs) —
+            # deliberately narrow, so a real registry fault surfaces rather
+            # than silently degrading to an entity_id that resolves to None.
             pass
         return f"{domain}.{self.zone_id}_{suffix}"
 
@@ -240,9 +251,16 @@ class ZoneCoordinator:
         if state is None or state.state in ("unknown", "unavailable"):
             return None
         try:
-            return datetime.fromisoformat(state.state)
+            parsed = datetime.fromisoformat(state.state)
         except (ValueError, TypeError):
             return None
+        # A naive timestamp can't be subtracted from an aware utcnow() — that
+        # TypeError would escape _check_stale_sensors (a @callback) and kill the
+        # rest of that tick. Z-Wave JS emits tz-aware ISO strings, so treat a
+        # naive one as UTC rather than discarding the reading.
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
     def sensor_stale_seconds(self, sensor_entity_id: str) -> float | None:
         """Seconds since sensor_entity_id last communicated, or None if unknown."""
@@ -288,8 +306,13 @@ class ZoneCoordinator:
             return True
 
     def in_dim_window(self) -> bool:
-        """Return True if current local time falls inside the nightlight window."""
-        now = datetime.now().strftime("%H:%M")
+        """Return True if current local time falls inside the nightlight window.
+
+        dt_util.now() honours the timezone configured in Home Assistant;
+        datetime.now() would read the host process's clock instead, which is
+        only the same thing by coincidence of container TZ setup.
+        """
+        now = dt_util.now().strftime("%H:%M")
 
         start_state = self.hass.states.get(self.eid("time", "dim_start"))
         end_state = self.hass.states.get(self.eid("time", "dim_end"))
@@ -334,7 +357,7 @@ class ZoneCoordinator:
             return
         pct = brightness_pct if brightness_pct is not None else self.target_brightness()
         context = Context()
-        self._own_light_context_id = context.id
+        self._own_light_context_ids.append(context.id)
         await self.hass.services.async_call(
             "light", "turn_on",
             {"entity_id": self.light, "brightness_pct": pct, "transition": 1},
@@ -382,12 +405,24 @@ class ZoneCoordinator:
         brightness, any time of day. Self-commanded changes (identified by
         context id, set by _light_on) are ignored so this doesn't fight the
         motion sequence's own dim-brightness calls or re-trigger itself.
+
+        Only an actual off->on edge counts. async_track_state_change_event also
+        fires for attribute-only updates, so without this guard any re-write
+        while the light is already on — a Z-Wave dimmer's delayed confirming
+        report, another integration touching the entity — reads as a switch
+        press and snaps the zone to full brightness. HA only carries the
+        originating context on entity writes for ~5s after the service call,
+        so a slower device report falls outside the context check above and
+        would otherwise defeat nightlight dimming outright (2026-08-10 review).
         """
         new_state = event.data.get("new_state")
         if new_state is None or new_state.state != "on":
             return
+        old_state = event.data.get("old_state")
+        if old_state is not None and old_state.state == "on":
+            return
         context = getattr(event, "context", None)
-        if context is not None and context.id == self._own_light_context_id:
+        if context is not None and context.id in self._own_light_context_ids:
             return
         if self.automation_disabled:
             return
@@ -438,6 +473,19 @@ class ZoneCoordinator:
         cut mid-cooking well under the 60-minute cap). Any retrigger during
         the window now resets it, the same guarantee _restart_motion_task
         already gives the ordinary motion path.
+
+        However this sequence exits, short of cancellation, it releases
+        motion_blocker. _start_switch_on_hold is the only thing that raises
+        that flag and this is the only thing that lowers it again, so any exit
+        path that skips the release latches the zone in "Manual Override"
+        forever — the same failure single-tap-down had in 2026-08-02. Disabled
+        mode used to be exactly such a path: flipping automation_disabled from
+        the HA UI mid-hold (rather than by double-tap, which clears the flag
+        itself) returned early and left the blocker up permanently. Only the
+        light-off is conditional on Disabled mode now; the release is not.
+        Cancellation is the one exception — whichever newer hold or motion
+        sequence cancelled this one has already raised the blocker for itself
+        and now owns it.
         """
         deadline = asyncio.get_running_loop().time() + self.switch_on_timeout_sec
         try:
@@ -477,9 +525,8 @@ class ZoneCoordinator:
                     break
                 # else: re-triggered during the grace period; loop back and wait for clear again
 
-            if self.automation_disabled:
-                return
-            await self._light_off()
+            if not self.automation_disabled:
+                await self._light_off()
             await self._set_switch("turn_off", self.eid("switch", "motion_blocker"), blocking=True)
         except asyncio.CancelledError:
             raise  # Propagate so the task is properly cancelled
@@ -512,7 +559,7 @@ class ZoneCoordinator:
                 self._notify_sensor_unavailable(entity_id, new_state)
             )
         elif old_state is not None and old_state.state == "unavailable":
-            self.hass.async_create_task(self._maybe_clear_unavailable())
+            self.hass.async_create_task(self._clear_sensor_unavailable(entity_id))
 
         # Motion trigger
         if new_state.state != "on":
@@ -594,7 +641,12 @@ class ZoneCoordinator:
     @callback
     def _handle_zwave_event(self, event: Event) -> None:
         data = event.data
-        if self.switch_device and data.get("device_id") != self.switch_device:
+        # CONF_SWITCH_DEVICE is optional. The old `if self.switch_device and ...`
+        # form short-circuited when it was unset, so a zone configured without a
+        # switch accepted Central Scene notifications from *every* Z-Wave device
+        # in the house — any scene controller anywhere drove this zone's taps
+        # (2026-08-10 review). No configured switch means no tap handling at all.
+        if not self.switch_device or data.get("device_id") != self.switch_device:
             return
         if data.get("command_class") != 91:
             return
@@ -681,30 +733,38 @@ class ZoneCoordinator:
     # Dim window (automations 7, 8, 9)
     # ------------------------------------------------------------------
 
+    def _should_reassert_brightness(self) -> bool:
+        """True when the light is on and Luminary is free to re-drive it.
+
+        Guards self.light being None as well: it's Required in the config flow,
+        but states.get(None) raises rather than returning None, so a config
+        entry written before that requirement would crash these handlers.
+        """
+        if not self.light:
+            return False
+        light_state = self.hass.states.get(self.light)
+        if light_state is None or light_state.state != "on":
+            return False
+        return not self.automation_disabled and not self.motion_blocker
+
     @callback
     def _handle_dim_window_start(self, now: datetime) -> None:
         if not self.nightlight_enabled:
             return
-        light_state = self.hass.states.get(self.light)
-        if light_state and light_state.state == "on":
-            if not self.automation_disabled and not self.motion_blocker:
-                self.hass.async_create_task(self._light_on(self.dim_brightness))
+        if self._should_reassert_brightness():
+            self.hass.async_create_task(self._light_on(self.dim_brightness))
 
     @callback
     def _handle_dim_window_end(self, now: datetime) -> None:
-        light_state = self.hass.states.get(self.light)
-        if light_state and light_state.state == "on":
-            if not self.automation_disabled and not self.motion_blocker:
-                self.hass.async_create_task(self._light_on(self.normal_brightness))
+        if self._should_reassert_brightness():
+            self.hass.async_create_task(self._light_on(self.normal_brightness))
 
     @callback
     def _handle_dim_time_entity_changed(self, event: Event) -> None:
         """Re-schedule dim triggers and re-apply brightness when window times change."""
         self.reschedule_dim_triggers()
-        light_state = self.hass.states.get(self.light)
-        if light_state and light_state.state == "on":
-            if not self.automation_disabled and not self.motion_blocker:
-                self.hass.async_create_task(self._light_on())
+        if self._should_reassert_brightness():
+            self.hass.async_create_task(self._light_on())
 
     def reschedule_dim_triggers(self) -> None:
         """Cancel existing dim time listeners and re-register with current values."""
@@ -732,12 +792,22 @@ class ZoneCoordinator:
     # Sensor unavailable notifications (automations 11 + 12)
     # ------------------------------------------------------------------
 
+    def _unavailable_notification_id(self, sensor_entity_id: str) -> str:
+        """One notification per sensor, not per zone.
+
+        A single shared per-zone id meant the second sensor to drop out
+        overwrote the first one's alert, so a multi-sensor zone could only ever
+        show one name — and recovery of that one sensor dismissed the alert for
+        every sensor still down (2026-08-10 review).
+        """
+        return f"{self.zone_id}_sensor_unavailable_{slugify(sensor_entity_id)}"
+
     async def _notify_sensor_unavailable(self, entity_id: str, state) -> None:
         name = state.attributes.get("friendly_name") or entity_id
         await self.hass.services.async_call(
             "persistent_notification", "create",
             {
-                "notification_id": f"{self.zone_id}_sensor_unavailable",
+                "notification_id": self._unavailable_notification_id(entity_id),
                 "title": f"{self.zone_name}: Motion Sensor Unavailable",
                 "message": (
                     f"{name} is unavailable. "
@@ -748,17 +818,12 @@ class ZoneCoordinator:
             blocking=False,
         )
 
-    async def _maybe_clear_unavailable(self) -> None:
-        all_ok = all(
-            (s := self.hass.states.get(sid)) is not None and s.state != "unavailable"
-            for sid in self.sensors
+    async def _clear_sensor_unavailable(self, entity_id: str) -> None:
+        await self.hass.services.async_call(
+            "persistent_notification", "dismiss",
+            {"notification_id": self._unavailable_notification_id(entity_id)},
+            blocking=False,
         )
-        if all_ok:
-            await self.hass.services.async_call(
-                "persistent_notification", "dismiss",
-                {"notification_id": f"{self.zone_id}_sensor_unavailable"},
-                blocking=False,
-            )
 
     # ------------------------------------------------------------------
     # Dead/stuck-sensor detection (last_seen staleness — see const.py comment)
@@ -768,6 +833,13 @@ class ZoneCoordinator:
     def _check_stale_sensors(self, now: datetime) -> None:
         """Periodic poll — staleness is an absence of updates, so it can't be caught
         by a state-change listener; something has to actively check the clock."""
+        # A sensor dropped from the zone stops being visited by the loop below, so
+        # its outstanding "may be dead" notification would otherwise never be
+        # dismissed and would sit in the UI indefinitely.
+        for removed in self._stale_notified - set(self.sensors):
+            self._stale_notified.discard(removed)
+            self.hass.async_create_task(self._clear_sensor_stale(removed))
+
         for sensor_entity_id in self.sensors:
             display_entity = self.last_seen_entities.get(sensor_entity_id)
             if display_entity is not None:

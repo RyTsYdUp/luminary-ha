@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -11,6 +14,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN
 from .coordinator import ZoneCoordinator
 from .hw_timeout import _zigbee2mqtt_property_key
+
+_LOGGER = logging.getLogger(__name__)
+
+# MQTT wildcards and the level separator — a device friendly_name containing any
+# of these can't be safely interpolated into a publish topic.
+MQTT_TOPIC_UNSAFE_CHARS = ("+", "#", "/")
 
 
 async def async_setup_entry(
@@ -74,6 +83,11 @@ class LuminaryRefreshHwTimeoutsButton(ButtonEntity):
         device registry `name` field mirrors — unverified beyond that inference; the
         Step 0 spike confirmed unique_id/platform naming but not this get-topic path,
         since that requires an actual MQTT publish rather than a read-only lookup.
+
+        Both halves used to be built by f-string interpolation. A friendly_name
+        containing an MQTT wildcard or a topic separator published somewhere other
+        than intended, and a quote in the property key produced malformed JSON —
+        so both are validated/encoded properly now (2026-08-10 review).
         """
         entry = ent_reg.async_get(source_entity_id)
         if entry is None or not entry.unique_id or not entry.device_id:
@@ -82,11 +96,18 @@ class LuminaryRefreshHwTimeoutsButton(ButtonEntity):
         device = dev_reg.async_get(entry.device_id)
         if not property_key or device is None or not device.name:
             return
+        if any(ch in device.name for ch in MQTT_TOPIC_UNSAFE_CHARS):
+            _LOGGER.warning(
+                "Skipping Zigbee2MQTT refresh for %s: device name %r is not safe "
+                "to interpolate into an MQTT topic",
+                source_entity_id, device.name,
+            )
+            return
         await hass.services.async_call(
             "mqtt", "publish",
             {
                 "topic": f"zigbee2mqtt/{device.name}/get",
-                "payload": f'{{"{property_key}": ""}}',
+                "payload": json.dumps({property_key: ""}),
             },
             blocking=False,
         )
