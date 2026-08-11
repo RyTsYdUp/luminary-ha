@@ -7,13 +7,13 @@
         "data": {
           "area_id": "Area",
           "sensors": "Motion sensors",
-          "light": "Light",
+          "light": "Lights",
           "switch_device": "Z-Wave switch (optional)"
         },
         "data_description": {
           "area_id": "The room or zone this automation covers",
           "sensors": "One or more motion sensors that cover this zone",
-          "light": "The light entity to control",
+          "light": "One or more light entities this zone controls — all of them are driven together",
           "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
         }
       },
@@ -34,7 +34,8 @@
     "error": {
       "area_not_found": "Selected area no longer exists.",
       "no_sensors": "At least one motion sensor is required.",
-      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow."
+      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow.",
+      "no_lights": "At least one light is required."
     }
   },
   "options": {
@@ -44,12 +45,12 @@
         "description": "Update the devices associated with this zone. The area cannot be changed — delete and re-add the zone to move it.",
         "data": {
           "sensors": "Motion sensors",
-          "light": "Light",
+          "light": "Lights",
           "switch_device": "Z-Wave switch (optional)"
         },
         "data_description": {
           "sensors": "One or more motion sensors that cover this zone",
-          "light": "The light entity to control",
+          "light": "One or more light entities this zone controls — all of them are driven together",
           "switch_device": "Z-Wave switch with Central Scene (command class 91) support"
         }
       },
@@ -66,7 +67,8 @@
     },
     "error": {
       "no_sensors": "At least one motion sensor is required.",
-      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow."
+      "detection_failed": "Couldn't auto-detect this sensor's hardware timeout. Enter the value from the sensor's manual/app, or enable its Configuration entity in Home Assistant and re-open this flow.",
+      "no_lights": "At least one light is required."
     }
   },
   "entity": {
@@ -100,7 +102,7 @@
         "name": "Stale Sensor Alert Threshold"
       },
       "switch_on_timeout_minutes": {
-        "name": "Switch On Auto-Shutoff"
+        "name": "Switch On Hold Time"
       }
     },
     "select": {

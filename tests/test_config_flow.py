@@ -85,7 +85,7 @@ async def test_user_step_area_not_found_error():
     flow.hass = _make_hass()
     with patch("custom_components.luminary_ha.config_flow.ar.async_get", return_value=FakeAreaRegistry()):
         result = await flow.async_step_user({
-            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: LIGHT,
+            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [LIGHT],
         })
     assert result["errors"]["area_id"] == "area_not_found"
 
@@ -95,7 +95,7 @@ async def test_user_step_no_sensors_error():
     flow.hass = _make_hass()
     with patch("custom_components.luminary_ha.config_flow.ar.async_get", return_value=_area_registry()):
         result = await flow.async_step_user({
-            "area_id": AREA_ID, CONF_SENSORS: [], CONF_LIGHT: LIGHT,
+            "area_id": AREA_ID, CONF_SENSORS: [], CONF_LIGHT: [LIGHT],
         })
     assert result["errors"][CONF_SENSORS] == "no_sensors"
 
@@ -108,7 +108,7 @@ async def test_user_step_valid_input_enters_confirm_timeout():
     with patch("custom_components.luminary_ha.config_flow.ar.async_get", return_value=_area_registry()), \
          patch("custom_components.luminary_ha.hw_timeout.async_detect_hw_timeout", return_value=detection):
         result = await flow.async_step_user({
-            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: LIGHT,
+            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [LIGHT],
         })
 
     assert result["type"] == "form"
@@ -132,7 +132,7 @@ async def test_full_flow_two_sensors_creates_entry_with_hw_timeouts():
     with patch("custom_components.luminary_ha.config_flow.ar.async_get", return_value=_area_registry()), \
          patch("custom_components.luminary_ha.hw_timeout.async_detect_hw_timeout", side_effect=fake_detect):
         result = await flow.async_step_user({
-            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1, SENSOR_2], CONF_LIGHT: LIGHT,
+            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1, SENSOR_2], CONF_LIGHT: [LIGHT],
         })
         assert result["step_id"] == "confirm_timeout"
         # accept the auto-detected default for sensor 1
@@ -156,7 +156,7 @@ async def test_detection_failure_shows_error_but_accepts_manual_entry():
     with patch("custom_components.luminary_ha.config_flow.ar.async_get", return_value=_area_registry()), \
          patch("custom_components.luminary_ha.hw_timeout.async_detect_hw_timeout", return_value=detection):
         result = await flow.async_step_user({
-            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: LIGHT,
+            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [LIGHT],
         })
         assert result["errors"]["base"] == "detection_failed"
 
@@ -175,7 +175,7 @@ async def test_editing_auto_filled_value_downgrades_to_manual():
 
     with patch("custom_components.luminary_ha.config_flow.ar.async_get", return_value=_area_registry()), \
          patch("custom_components.luminary_ha.hw_timeout.async_detect_hw_timeout", return_value=detection):
-        await flow.async_step_user({"area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: LIGHT})
+        await flow.async_step_user({"area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [LIGHT]})
         result = await flow.async_step_confirm_timeout({"hw_timeout_sec": 99.0})  # user typed something else
 
     hw_timeouts = result["options"][CONF_SENSOR_HW_TIMEOUTS]
@@ -194,7 +194,7 @@ class _FakeConfigEntry:
 async def test_options_flow_skips_already_tracked_sensors():
     existing_options = {
         CONF_SENSORS: [SENSOR_1],
-        CONF_LIGHT: LIGHT,
+        CONF_LIGHT: [LIGHT],
         CONF_SWITCH_DEVICE: None,
         CONF_SENSOR_HW_TIMEOUTS: {
             SENSOR_1: {"timeout_sec": 10.0, "source": "zwave", "source_entity_id": "number.src_1"},
@@ -206,7 +206,7 @@ async def test_options_flow_skips_already_tracked_sensors():
 
     # SENSOR_1 already live-tracked -> should go straight to create_entry, no form
     result = await flow.async_step_init({
-        CONF_SENSORS: [SENSOR_1], CONF_LIGHT: LIGHT, CONF_SWITCH_DEVICE: None,
+        CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [LIGHT], CONF_SWITCH_DEVICE: None,
     })
 
     assert result["type"] == "create_entry"
@@ -216,7 +216,7 @@ async def test_options_flow_skips_already_tracked_sensors():
 async def test_options_flow_prompts_only_for_new_sensor():
     existing_options = {
         CONF_SENSORS: [SENSOR_1],
-        CONF_LIGHT: LIGHT,
+        CONF_LIGHT: [LIGHT],
         CONF_SWITCH_DEVICE: None,
         CONF_SENSOR_HW_TIMEOUTS: {
             SENSOR_1: {"timeout_sec": 10.0, "source": "zwave", "source_entity_id": "number.src_1"},
@@ -229,7 +229,7 @@ async def test_options_flow_prompts_only_for_new_sensor():
 
     with patch("custom_components.luminary_ha.hw_timeout.async_detect_hw_timeout", return_value=detection):
         result = await flow.async_step_init({
-            CONF_SENSORS: [SENSOR_1, SENSOR_2], CONF_LIGHT: LIGHT, CONF_SWITCH_DEVICE: None,
+            CONF_SENSORS: [SENSOR_1, SENSOR_2], CONF_LIGHT: [LIGHT], CONF_SWITCH_DEVICE: None,
         })
         assert result["step_id"] == "confirm_timeout"  # only prompted for SENSOR_2
         result = await flow.async_step_confirm_timeout({"hw_timeout_sec": 25.0})
@@ -242,7 +242,7 @@ async def test_options_flow_prompts_only_for_new_sensor():
 async def test_options_flow_prunes_removed_sensor():
     existing_options = {
         CONF_SENSORS: [SENSOR_1, SENSOR_2],
-        CONF_LIGHT: LIGHT,
+        CONF_LIGHT: [LIGHT],
         CONF_SWITCH_DEVICE: None,
         CONF_SENSOR_HW_TIMEOUTS: {
             SENSOR_1: {"timeout_sec": 10.0, "source": "zwave", "source_entity_id": "number.src_1"},
@@ -255,7 +255,7 @@ async def test_options_flow_prunes_removed_sensor():
 
     # SENSOR_2 removed from the zone
     result = await flow.async_step_init({
-        CONF_SENSORS: [SENSOR_1], CONF_LIGHT: LIGHT, CONF_SWITCH_DEVICE: None,
+        CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [LIGHT], CONF_SWITCH_DEVICE: None,
     })
 
     assert result["type"] == "create_entry"
@@ -264,10 +264,84 @@ async def test_options_flow_prunes_removed_sensor():
 
 
 async def test_options_flow_no_sensors_error():
-    entry = _FakeConfigEntry({CONF_SENSORS: [], CONF_LIGHT: LIGHT, CONF_SWITCH_DEVICE: None})
+    entry = _FakeConfigEntry({CONF_SENSORS: [], CONF_LIGHT: [LIGHT], CONF_SWITCH_DEVICE: None})
     flow = config_flow.LuminaryOptionsFlow(entry)
     flow.hass = _make_hass()
 
-    result = await flow.async_step_init({CONF_SENSORS: [], CONF_LIGHT: LIGHT, CONF_SWITCH_DEVICE: None})
+    result = await flow.async_step_init({CONF_SENSORS: [], CONF_LIGHT: [LIGHT], CONF_SWITCH_DEVICE: None})
 
     assert result["errors"][CONF_SENSORS] == "no_sensors"
+
+
+# ---------------------------------------------------------------------------
+# Multi-light validation (2026-08-10)
+#
+# CONF_LIGHT is a multiple EntitySelector now, so "required" no longer means
+# "non-empty" — vol.Required is satisfied by an empty list. Both flows need the
+# same explicit emptiness check CONF_SENSORS already had.
+# ---------------------------------------------------------------------------
+
+
+async def test_user_step_no_lights_error():
+    flow = config_flow.LuminaryConfigFlow()
+    flow.hass = _make_hass()
+    with patch("custom_components.luminary_ha.config_flow.ar.async_get", return_value=_area_registry()):
+        result = await flow.async_step_user({
+            "area_id": AREA_ID, CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [],
+        })
+    assert result["errors"][CONF_LIGHT] == "no_lights"
+
+
+async def test_options_step_no_lights_error():
+    entry = _FakeConfigEntry({CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [LIGHT], CONF_SWITCH_DEVICE: None})
+    flow = config_flow.LuminaryOptionsFlow(entry)
+    flow.hass = _make_hass()
+
+    result = await flow.async_step_init({
+        CONF_SENSORS: [SENSOR_1], CONF_LIGHT: [], CONF_SWITCH_DEVICE: None,
+    })
+    assert result["errors"][CONF_LIGHT] == "no_lights"
+
+
+async def test_options_step_accepts_multiple_lights():
+    # SENSOR_1 already live-tracked, so this goes straight to create_entry
+    # rather than detouring through confirm_timeout.
+    entry = _FakeConfigEntry({
+        CONF_SENSORS: [SENSOR_1],
+        CONF_LIGHT: [LIGHT],
+        CONF_SWITCH_DEVICE: None,
+        CONF_SENSOR_HW_TIMEOUTS: {
+            SENSOR_1: {"timeout_sec": 10.0, "source": "zwave", "source_entity_id": "number.src_1"},
+        },
+    })
+    flow = config_flow.LuminaryOptionsFlow(entry)
+    flow.hass = _make_hass()
+
+    result = await flow.async_step_init({
+        CONF_SENSORS: [SENSOR_1],
+        CONF_LIGHT: [LIGHT, "light.hallway_accent"],
+        CONF_SWITCH_DEVICE: None,
+    })
+
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_LIGHT] == [LIGHT, "light.hallway_accent"]
+
+
+async def test_options_step_prefills_legacy_string_light_as_list():
+    """A zone configured before multi-light support stored a bare entity_id
+    string; the selector is multiple now and needs a list to pre-fill from."""
+    entry = _FakeConfigEntry({CONF_SENSORS: [SENSOR_1], CONF_LIGHT: LIGHT, CONF_SWITCH_DEVICE: None})
+    flow = config_flow.LuminaryOptionsFlow(entry)
+    flow.hass = _make_hass()
+
+    captured = {}
+
+    def _capture(schema, suggested):
+        captured.update(suggested)
+        return schema
+
+    flow.add_suggested_values_to_schema = _capture
+    result = await flow.async_step_init()
+
+    assert result["type"] == "form"
+    assert captured[CONF_LIGHT] == [LIGHT]

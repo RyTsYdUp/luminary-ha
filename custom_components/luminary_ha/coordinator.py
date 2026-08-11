@@ -103,8 +103,21 @@ class ZoneCoordinator:
         return self.entry.options.get(CONF_SENSORS, [])
 
     @property
-    def light(self) -> str | None:
-        return self.entry.options.get(CONF_LIGHT)
+    def lights(self) -> list[str]:
+        """Every light entity this zone drives, as a list.
+
+        Normalised on read rather than migrated: zones configured before
+        multi-light support (2026-08-10) stored CONF_LIGHT as a bare entity_id
+        string, and those entries keep working untouched until the next time
+        the options flow is saved, which writes a list. Handles the string,
+        list, and missing/None cases so no config-entry version bump is needed.
+        """
+        configured = self.entry.options.get(CONF_LIGHT)
+        if not configured:
+            return []
+        if isinstance(configured, str):
+            return [configured]
+        return list(configured)
 
     @property
     def switch_device(self) -> str | None:
@@ -274,7 +287,15 @@ class ZoneCoordinator:
         return self._float(self.eid("number", "stale_sensor_minutes"), DEFAULT_STALE_SENSOR_MINUTES) * 60
 
     @property
-    def switch_on_timeout_sec(self) -> float:
+    def switch_on_hold_sec(self) -> float:
+        """How long a switch-triggered on holds the light before handing the
+        zone back to automation.
+
+        Surfaced to the user as "Switch On Hold Time". The entity key is still
+        `switch_on_timeout_minutes` — renaming it would change the unique_id,
+        mint a fresh entity and reset everyone's configured value, so only the
+        display name moved when the semantics changed (2026-08-10).
+        """
         return self._float(
             self.eid("number", "switch_on_timeout_minutes"), DEFAULT_SWITCH_ON_TIMEOUT_MINUTES
         ) * 60
@@ -353,24 +374,29 @@ class ZoneCoordinator:
     # ------------------------------------------------------------------
 
     async def _light_on(self, brightness_pct: int | None = None) -> None:
-        if not self.light:
+        lights = self.lights
+        if not lights:
             return
         pct = brightness_pct if brightness_pct is not None else self.target_brightness()
         context = Context()
         self._own_light_context_ids.append(context.id)
+        # One service call for the whole list — a single call keeps every light
+        # in the zone on the same context id, so _handle_light_change recognises
+        # all of the resulting state changes as self-commanded.
         await self.hass.services.async_call(
             "light", "turn_on",
-            {"entity_id": self.light, "brightness_pct": pct, "transition": 1},
+            {"entity_id": lights, "brightness_pct": pct, "transition": 1},
             blocking=False,
             context=context,
         )
 
     async def _light_off(self) -> None:
-        if not self.light:
+        lights = self.lights
+        if not lights:
             return
         await self.hass.services.async_call(
             "light", "turn_off",
-            {"entity_id": self.light, "transition": 1},
+            {"entity_id": lights, "transition": 1},
             blocking=False,
         )
 
@@ -387,7 +413,7 @@ class ZoneCoordinator:
 
     @callback
     def _handle_light_change(self, event: Event) -> None:
-        """Route any switch-triggered on into the full-bright auto-shutoff hold.
+        """Route any switch-triggered on into the full-bright timed hold.
 
         Z-Wave dimmers restore their own last-remembered level on a plain
         physical tap, independent of anything Luminary commanded — that
@@ -429,18 +455,18 @@ class ZoneCoordinator:
         self.hass.async_create_task(self._start_switch_on_hold())
 
     # ------------------------------------------------------------------
-    # Switch-triggered on: full brightness + timed auto-shutoff
+    # Switch-triggered on: full brightness + timed hold
     # ------------------------------------------------------------------
 
     async def _start_switch_on_hold(self) -> None:
-        """Turn the light on at full/normal brightness and hold it via a
-        timed auto-shutoff sequence.
+        """Turn the light on at full/normal brightness and hold it for
+        switch_on_hold_sec.
 
         Entered by any switch-triggered on: the main paddle's single-tap-up,
         or an unsolicited on-report from a non-Central-Scene companion
         switch (routed here by _handle_light_change). A no-op in Disabled
         (double-tap) mode — that mode intentionally has no nightlight, no
-        motion, and no auto-shutoff at all.
+        motion, and no hold at all.
         """
         if self.automation_disabled:
             return
@@ -451,85 +477,59 @@ class ZoneCoordinator:
         self._motion_task = self.hass.async_create_task(self._run_switch_on_sequence())
 
     async def _run_switch_on_sequence(self) -> None:
-        """Auto-shutoff for a switch-triggered on.
+        """Hold the light on for switch_on_hold_sec, then hand the zone back
+        to automation.
 
-        Unlike the motion sequence — which is torn down and restarted fresh
-        by every new motion trigger via _restart_motion_task — this sequence
-        keeps running for as long as motion_blocker holds it exclusive of
-        the ordinary motion listener (see _handle_sensor_change's guard), so
-        it has to watch for re-triggers itself: each clear + light_on_time_sec
-        grace period that ends with a sensor back on loops back to waiting
-        again, rather than turning off out from under someone still there.
-        switch_on_timeout_sec is an overall cap so it still turns off
-        eventually even if the space is never genuinely clear (or a sensor
-        is stuck) — that's the actual point of an *auto-shutoff*.
+        A plain timer: motion neither shortens the hold nor extends it. A
+        switch press is an explicit request for light, so the configured time
+        is a guarantee, not a cap — pressing the switch means "keep this on
+        for the next hour", full stop, and the end of the timer is what
+        catches a light somebody forgot to turn off.
 
-        The grace period watches for any new on-event over its *entire*
-        window rather than sleeping blind and sampling state once at the
-        end — sensors with a short onboard hardware clear-timeout (e.g. 10s)
-        report brief off-blips during continuous real occupancy, so a single
-        instantaneous sample can land mid-blip and wrongly conclude the room
-        is empty (2026-08-10 kitchen incident: cabinet lights kept getting
-        cut mid-cooking well under the 60-minute cap). Any retrigger during
-        the window now resets it, the same guarantee _restart_motion_task
-        already gives the ordinary motion path.
+        This replaces a clear-then-grace loop (2026-08-10) that released the
+        hold light_on_time_sec after the sensors last went quiet, treating
+        switch_on_hold_sec only as an upper bound. That let a deliberate press
+        expire in minutes: on the kitchen zone a press held the cabinet lights
+        for 4m25s of a nominal 60 minutes, because standing still at a counter
+        reads as an empty room to a PIR. Motion-based release belongs to the
+        motion path, which has its own tuning for exactly this; a switch press
+        should not be second-guessed by a sensor.
 
-        However this sequence exits, short of cancellation, it releases
-        motion_blocker. _start_switch_on_hold is the only thing that raises
-        that flag and this is the only thing that lowers it again, so any exit
-        path that skips the release latches the zone in "Manual Override"
-        forever — the same failure single-tap-down had in 2026-08-02. Disabled
-        mode used to be exactly such a path: flipping automation_disabled from
-        the HA UI mid-hold (rather than by double-tap, which clears the flag
-        itself) returned early and left the blocker up permanently. Only the
-        light-off is conditional on Disabled mode now; the release is not.
-        Cancellation is the one exception — whichever newer hold or motion
-        sequence cancelled this one has already raised the blocker for itself
-        and now owns it.
+        Cancellation is the one exit that does *not* release motion_blocker:
+        whichever newer hold or motion sequence cancelled this one has already
+        raised the flag for itself and now owns it. Every other exit must
+        release it, or the zone latches in "Manual Override" forever — the
+        failure single-tap-down had in 2026-08-02 and this sequence had via
+        Disabled mode until 2026-08-10.
         """
-        deadline = asyncio.get_running_loop().time() + self.switch_on_timeout_sec
         try:
-            while True:
-                cleared = asyncio.Event()
-                retriggered = asyncio.Event()
-
-                @callback
-                def _on_change(event: Event) -> None:
-                    new_state = event.data.get("new_state")
-                    if new_state is not None and new_state.state == "on":
-                        retriggered.set()
-                    if not any(self.hass.states.is_state(s, "on") for s in self.sensors):
-                        cleared.set()
-
-                unsub = async_track_state_change_event(self.hass, self.sensors, _on_change)
-                try:
-                    if not any(self.hass.states.is_state(s, "on") for s in self.sensors):
-                        cleared.set()
-                    remaining = max(deadline - asyncio.get_running_loop().time(), 0)
-                    try:
-                        await asyncio.wait_for(cleared.wait(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        break  # cap reached; shut off regardless of activity
-
-                    retriggered.clear()
-                    remaining = max(deadline - asyncio.get_running_loop().time(), 0)
-                    grace = min(float(self.light_on_time_sec), remaining)
-                    try:
-                        await asyncio.wait_for(retriggered.wait(), timeout=grace)
-                    except asyncio.TimeoutError:
-                        break  # no retrigger for the full grace window; genuinely clear
-                finally:
-                    unsub()
-
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                # else: re-triggered during the grace period; loop back and wait for clear again
-
-            if not self.automation_disabled:
-                await self._light_off()
-            await self._set_switch("turn_off", self.eid("switch", "motion_blocker"), blocking=True)
+            await asyncio.sleep(self.switch_on_hold_sec)
+            await self._release_switch_hold()
         except asyncio.CancelledError:
             raise  # Propagate so the task is properly cancelled
+
+    async def _release_switch_hold(self) -> None:
+        """End a switch hold: drop the override, then let the normal rules
+        decide what the light should be doing.
+
+        "Back to auto" rather than "off": if someone is genuinely still in the
+        room and it's dark enough for the zone to be active, the motion
+        sequence picks the light up and carries it. Turning off unconditionally
+        would cut the light and then have the sensor's next report — within
+        ~10s on these hardware timeouts — turn it straight back on, a visible
+        flicker. When the zone wouldn't act on motion anyway (daylight, or
+        nobody there), auto means off.
+        """
+        await self._set_switch("turn_off", self.eid("switch", "motion_blocker"), blocking=True)
+        if self.automation_disabled:
+            return
+        if any(self.hass.states.is_state(s, "on") for s in self.sensors) and self.is_dark_enough():
+            # Hand off directly rather than via _restart_motion_task: that
+            # cancels whatever sits in self._motion_task, which right now is
+            # *this* task — self-cancelling would abort the handoff mid-flight.
+            self._motion_task = self.hass.async_create_task(self._run_motion_sequence())
+            return
+        await self._light_off()
 
     # ------------------------------------------------------------------
     # Motion sequence (automations 1 + 10)
@@ -666,12 +666,12 @@ class ZoneCoordinator:
             self.hass.async_create_task(self._scene3_reset())
 
     async def _single_tap_up(self) -> None:
-        """Full bright with a timed auto-shutoff hold (smart) or plain on (dumb).
+        """Full bright with a timed hold (smart) or plain on (dumb).
 
         Delegates to _start_switch_on_hold — the same entry point a
         non-Central-Scene companion switch reaches via _handle_light_change —
         so a main-paddle tap and a companion-switch press behave identically:
-        full brightness, never dim, auto-shutoff unless Disabled mode.
+        full brightness, never dim, timed hold unless Disabled mode.
         """
         if self.automation_disabled:
             await self._light_on(self.normal_brightness)
@@ -733,17 +733,18 @@ class ZoneCoordinator:
     # Dim window (automations 7, 8, 9)
     # ------------------------------------------------------------------
 
-    def _should_reassert_brightness(self) -> bool:
-        """True when the light is on and Luminary is free to re-drive it.
+    def _any_light_on(self) -> bool:
+        return any(self.hass.states.is_state(light, "on") for light in self.lights)
 
-        Guards self.light being None as well: it's Required in the config flow,
-        but states.get(None) raises rather than returning None, so a config
-        entry written before that requirement would crash these handlers.
+    def _should_reassert_brightness(self) -> bool:
+        """True when at least one of the zone's lights is on and Luminary is
+        free to re-drive it.
+
+        Any-on rather than all-on: the dim-window handlers re-assert brightness
+        across the whole zone, and a zone that's partly lit still wants the
+        window's brightness applied to the lit part.
         """
-        if not self.light:
-            return False
-        light_state = self.hass.states.get(self.light)
-        if light_state is None or light_state.state != "on":
+        if not self._any_light_on():
             return False
         return not self.automation_disabled and not self.motion_blocker
 
@@ -972,10 +973,10 @@ class ZoneCoordinator:
                 "zwave_js_value_notification", self._handle_zwave_event
             )
         )
-        if self.light:
+        if self.lights:
             self._unsub_listeners.append(
                 async_track_state_change_event(
-                    self.hass, [self.light], self._handle_light_change
+                    self.hass, self.lights, self._handle_light_change
                 )
             )
         self._sensors_any_on = any(

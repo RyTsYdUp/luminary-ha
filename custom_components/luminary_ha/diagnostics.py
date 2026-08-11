@@ -41,7 +41,15 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict:
     sensors = entry.options.get(CONF_SENSORS, [])
-    light = entry.options.get(CONF_LIGHT)
+    configured_light = entry.options.get(CONF_LIGHT)
+    # Same string-or-list normalisation as ZoneCoordinator.lights, done locally so
+    # diagnostics still renders when the coordinator isn't registered (mid-setup).
+    if not configured_light:
+        lights = []
+    elif isinstance(configured_light, str):
+        lights = [configured_light]
+    else:
+        lights = list(configured_light)
     switch_device = entry.options.get(CONF_SWITCH_DEVICE)
     coordinator: ZoneCoordinator | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
 
@@ -91,12 +99,12 @@ async def async_get_config_entry_diagnostics(
         },
         "config": {
             "sensors": sensors,
-            "light": light,
+            "lights": lights,
             "switch_device": switch_device,
         },
         "live_state": {
             "sensors": {entity_id: _state(entity_id) for entity_id in sensors},
-            "light": _state(light) if light else None,
+            "lights": {entity_id: _state(entity_id) for entity_id in lights},
         },
         "hw_timeouts": hw_timeouts,
         "stale_sensors": stale_sensors,

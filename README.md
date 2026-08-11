@@ -7,17 +7,18 @@ A Home Assistant custom integration for configurable motion-activated lighting i
 ## Features
 
 - **Multi-sensor support** — watches multiple motion sensors; all must clear before lights turn off
+- **Multi-light support** — a zone can drive any number of light entities, all commanded together in a single service call so they stay in step
 - **Configurable light-on time** — maximum seconds to wait for sensors to clear; acts as a safety cutoff if a sensor gets stuck
 - **Stuck-sensor recovery** — when lights time out with sensors still on, polls Z-Wave JS to force a fresh state report
 - **Sensor unavailable alerts** — persistent HA notification when any sensor goes offline
 - **Dead-sensor detection** — persistent HA notification when a sensor stops communicating for too long, even if it never reports "unavailable" (a failing battery can hold a sensor's last state indefinitely without HA ever flagging it — see below)
 - **Switch-triggered on: full brightness, always** — any off→on report from something other than Luminary's own motion logic (a main-paddle tap, or a non-Central-Scene 3-way companion switch on the same circuit reporting a stale remembered dimmer level) always goes to full/normal brightness, any time of day or night. Nightlight dim brightness is reserved for motion-triggered activations only — a switch never comes on dim.
-- **Switch-triggered auto-shutoff** — a switch-triggered on (main paddle or companion switch) starts a timed hold that turns the light back off if nobody's there, so a switch flipped on and forgotten doesn't stay on indefinitely. Extends automatically while motion keeps clearing/retriggering; capped by **Switch On Auto-Shutoff** regardless. Only Disabled (double-tap) mode is exempt.
+- **Switch-triggered hold** — a switch-triggered on (main paddle or companion switch) keeps the light on for the full **Switch On Hold Time**, then hands the zone back to automation. A press is an explicit request for light, so motion neither shortens the hold nor extends it: no getting cut off because you stood still long enough to look empty to a PIR, and no staying on past the timer because a sensor is stuck. The end of the hold is what catches a light somebody forgot to turn off. Tap down to end it early. Only Disabled (double-tap) mode is exempt.
 - **Day/night brightness profiles** — separate brightness levels for a configurable nightlight window, applied to motion-triggered activations only
 - **Daytime detection** — optional; suppress the automation during daylight via sun elevation or a lux sensor
 - **Live configuration** — all settings are native HA entities (sliders, switches, time pickers) on the device page; no YAML edits needed
 - **Three switch modes** via Z-Wave central scene (command class 91):
-  - Single tap up: full bright, with a timed auto-shutoff hold
+  - Single tap up: full bright, with a timed hold
   - Single tap down: turn light off (momentary — doesn't stay in override; motion resumes normally on the next trigger)
   - Double tap up: disable all automation (dumb switch mode)
   - Double tap down: re-enable automation
@@ -28,7 +29,7 @@ A Home Assistant custom integration for configurable motion-activated lighting i
 - Home Assistant 2024.1+
 - Z-Wave JS integration (optional — required for switch scenes and stuck-sensor recovery)
 - 1 or more motion sensors (binary sensors)
-- A dimmable light entity
+- One or more dimmable light entities
 - A Z-Wave switch with **Central Scene (command class 91)** support (optional)
 
 ## Installation
@@ -51,7 +52,7 @@ Copy `custom_components/luminary_ha/` into your HA config directory:
 
 **Settings → Devices & Services → Add Integration → Luminary**
 
-Select an area, then pick your motion sensors, light entity, and (optionally) your Z-Wave switch.
+Select an area, then pick your motion sensors, one or more light entities, and (optionally) your Z-Wave switch.
 
 Each zone gets its own device page with all controls and settings.
 
@@ -72,21 +73,21 @@ All settings are on the device page under the **Configuration** section. Changes
 | **Normal Brightness** | % brightness outside nightlight window |
 | **Light On Time** | Max seconds to wait for sensors to clear (see note below) |
 | **Stale Sensor Alert Threshold** | Minutes of silence from a sensor before it's flagged as possibly dead. Default 60 min. |
-| **Switch On Auto-Shutoff** | Minutes a switch-triggered on (main paddle or companion switch) can stay on before it's forced off, if nothing keeps clearing/retriggering it. Default 60 min. |
+| **Switch On Hold Time** | Minutes a switch-triggered on (main paddle or companion switch) keeps the light on, regardless of motion. When it elapses the zone goes back to automatic control — which is what turns off a light somebody forgot about. Default 60 min. |
 
 ### Controls
 
 | Entity | Description |
 |---|---|
-| **Manual Override** switch | On while a switch-triggered hold is active (blocks motion automation from fighting it); auto-clears when the hold's auto-shutoff turns the light back off |
-| **Automation Disabled** switch | Dumb switch mode — motion, nightlight, and auto-shutoff all ignored entirely |
+| **Manual Override** switch | On while a switch-triggered hold is active (blocks motion automation from fighting it); auto-clears when the hold's timer elapses and the zone goes back to automatic control |
+| **Automation Disabled** switch | Dumb switch mode — motion, nightlight, and the switch hold all ignored entirely |
 | **Automation Status** sensor | Automated / Standby / Manual Override / Disabled |
 
 ## Switch Behavior Reference
 
 | Action | When automation enabled | When dumb mode active |
 |---|---|---|
-| Single tap up | Full bright, manual override on, timed auto-shutoff hold started (see **Switch On Auto-Shutoff**) | Turn light on at Normal Brightness |
+| Single tap up | Full bright, manual override on, timed hold started (see **Switch On Hold Time**) | Turn light on at Normal Brightness |
 | Single tap down | Light off; override engaged only for the instant of the off-command, then cleared — motion resumes normally afterward | Turn light off |
 | Double tap up | Enable dumb mode | — (already in dumb mode) |
 | Double tap down | — (already enabled) | Re-enable automation |

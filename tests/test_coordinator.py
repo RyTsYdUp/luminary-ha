@@ -100,17 +100,24 @@ Light-change dispatch (_handle_light_change) — 2026-08-02 auto-shutoff feature
   63c. off → on edge                            → still dispatches (companion switch)
   63d. unavailable → on edge                    → still dispatches
 
-Switch-triggered on: full brightness + auto-shutoff (_start_switch_on_hold / _run_switch_on_sequence)
+Switch-triggered on: full brightness + timed hold (_start_switch_on_hold / _run_switch_on_sequence)
   64. Smart mode                                → blocker on, light on at normal_brightness, sequence started
   65. Dumb mode (automation_disabled)           → no-op entirely
   66. Cancels an in-progress motion/hold task first
-  67. Sensors clear well within timeout         → light off + blocker off after light_on_time_sec grace
-  68. Sensors never clear                       → cap reached, light off anyway
-  69. Sensor re-triggers during grace period    → loops back, stays on (event-driven, not sampled)
-  70. automation_disabled during wait           → skipped, light left alone
-  70b. automation_disabled during wait          → motion_blocker still released
-  70c. Cap reached                              → motion_blocker released
-  71. CancelledError propagates cleanly         → no light off
+  67. Hold expires, room clear                  → light off + blocker released
+  68. Room goes quiet mid-hold                  → hold does NOT end early
+  69. Motion still active at expiry, daytime    → hold does NOT extend; light off
+  69b. Motion still active at expiry, dark      → handed to the motion sequence, light not cut
+  69c. Handoff doesn't self-cancel the running task
+  70. automation_disabled during hold           → skipped, light left alone
+  70b. automation_disabled during hold          → motion_blocker still released
+  71. CancelledError propagates cleanly         → no light off, blocker NOT released
+
+Multiple lights per zone (2026-08-10)
+  72. Legacy string CONF_LIGHT normalises to a one-element list
+  73. List CONF_LIGHT passes through; missing/empty → []
+  74. All lights driven in one service call, on one context id
+  75. _any_light_on is true when any single light is on
 """
 
 from __future__ import annotations
@@ -232,7 +239,7 @@ def _make_entry() -> MagicMock:
     }
     entry.options = {
         CONF_SENSORS: [SENSOR_1, SENSOR_2],
-        CONF_LIGHT: LIGHT,
+        CONF_LIGHT: [LIGHT],  # canonical form since multi-light support (2026-08-10)
         CONF_SWITCH_DEVICE: SWITCH_DEVICE,
     }
     return entry
@@ -638,7 +645,7 @@ class TestZwaveSwitchHandlers:
         await coord._single_tap_up()
         coord.hass.services.async_call.assert_any_call(
             "light", "turn_on",
-            {"entity_id": LIGHT, "brightness_pct": 100, "transition": 1},
+            {"entity_id": [LIGHT], "brightness_pct": 100, "transition": 1},
             blocking=False,
             context=ANY,
         )
@@ -658,7 +665,7 @@ class TestZwaveSwitchHandlers:
         await coord._single_tap_down()
         coord.hass.services.async_call.assert_any_call(
             "light", "turn_off",
-            {"entity_id": LIGHT, "transition": 1},
+            {"entity_id": [LIGHT], "transition": 1},
             blocking=False,
         )
         coord.hass.services.async_call.assert_any_call(
@@ -689,7 +696,7 @@ class TestZwaveSwitchHandlers:
         coord._motion_task = fake_task
         await coord._single_tap_down()
         coord.hass.services.async_call.assert_any_call(
-            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+            "light", "turn_off", {"entity_id": [LIGHT], "transition": 1}, blocking=False
         )
         coord._restart_motion_task.assert_not_called()
         fake_task.cancel.assert_called_once()
@@ -699,7 +706,7 @@ class TestZwaveSwitchHandlers:
         states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
         await coord._single_tap_down()
         coord.hass.services.async_call.assert_any_call(
-            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+            "light", "turn_off", {"entity_id": [LIGHT], "transition": 1}, blocking=False
         )
 
     async def test_40_double_tap_up(self, coord):
@@ -752,7 +759,7 @@ class TestZwaveSwitchHandlers:
             blocking=False,
         )
         coord.hass.services.async_call.assert_any_call(
-            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+            "light", "turn_off", {"entity_id": [LIGHT], "transition": 1}, blocking=False
         )
 
 
@@ -1058,7 +1065,7 @@ class TestSwitchOnHold:
         )
         coord.hass.services.async_call.assert_any_call(
             "light", "turn_on",
-            {"entity_id": LIGHT, "brightness_pct": 100, "transition": 1},
+            {"entity_id": [LIGHT], "brightness_pct": 100, "transition": 1},
             blocking=False,
             context=ANY,
         )
@@ -1079,19 +1086,17 @@ class TestSwitchOnHold:
         await coord._start_switch_on_hold()
         fake_task.cancel.assert_called_once()
 
-    async def test_67_sensors_clear_within_timeout_turns_off_after_grace(self, coord, states):
-        """Sensors already clear → cleared immediately, light off after the
-        light_on_time_sec grace period, blocker released."""
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
-        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")
+    async def test_67_hold_expires_with_room_clear_turns_off(self, coord, states):
+        """The ordinary ending: hold elapses, nobody there → light off,
+        blocker released, zone back under automation."""
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "0")
         states.put(SENSOR_1, "off")
         states.put(SENSOR_2, "off")
 
-        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
-            await coord._run_switch_on_sequence()
+        await coord._run_switch_on_sequence()
 
         coord.hass.services.async_call.assert_any_call(
-            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+            "light", "turn_off", {"entity_id": [LIGHT], "transition": 1}, blocking=False
         )
         coord.hass.services.async_call.assert_any_call(
             "switch", "turn_off",
@@ -1099,78 +1104,104 @@ class TestSwitchOnHold:
             blocking=True,
         )
 
-    async def test_68_never_clears_hits_cap_and_turns_off_anyway(self, coord, states):
-        """Sensors stay "on" the whole time (or a sensor is stuck) → the
-        overall switch_on_timeout_sec cap fires and the light is turned off
-        regardless — the actual point of an auto-shutoff safety net."""
-        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", str(0.02 / 60))  # ~1.2ms cap
-        states.put(SENSOR_1, "on")
+    async def test_68_motion_does_not_shorten_the_hold(self, coord, states):
+        """The 2026-08-10 kitchen regression, as a test.
 
-        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
-            await coord._run_switch_on_sequence()
-
-        coord.hass.services.async_call.assert_any_call(
-            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
-        )
-
-    async def test_69_retrigger_during_grace_period_loops_and_stays_on(self, coord, states):
-        """A new on-event fires again during the grace window → loop back
-        and wait for clear again instead of turning off out from under
-        someone still there.
-
-        Event-driven now, not a single instantaneous end-of-sleep sample
-        (2026-08-10 fix) — a sensor with a short onboard hardware
-        clear-timeout can report a brief off-blip mid-occupancy, and the
-        old sample-once check could land right on top of one of those
-        blips despite continuous real presence.
+        Sensors going quiet mid-hold must not end it early. The old
+        clear-then-grace loop released the hold light_on_time_sec after the
+        room last read clear, so a press that nominally lasted 60 minutes
+        expired in 4m25s when someone stood still at a counter. The hold is
+        a plain timer now — a switch press is an explicit request for light
+        and a PIR does not get to second-guess it.
         """
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "60")
-        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")  # long hold
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")           # would have fired instantly before
         states.put(SENSOR_1, "off")
         states.put(SENSOR_2, "off")
 
-        captured = []
+        task = asyncio.ensure_future(coord._run_switch_on_sequence())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
-        def fake_track(hass, entities, cb):
-            captured.append(cb)
-            return lambda: None
+        assert not task.done()
+        off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
+        assert off_calls == []
 
-        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", fake_track):
-            task = asyncio.ensure_future(coord._run_switch_on_sequence())
-            await asyncio.sleep(0)  # let it reach the grace-period wait (1st pass)
-
-            # Retrigger during the grace window
-            states.put(SENSOR_1, "on")
-            captured[-1](Event({"entity_id": SENSOR_1, "new_state": _s("on")}))
-            await asyncio.sleep(0)  # loop back to the top, re-subscribe
-
-            # Let the sensors genuinely clear for the 2nd pass, and shrink
-            # the grace window so it finishes without a real 60s wait
-            states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
-            states.put(SENSOR_1, "off")
-            captured[-1](Event({"entity_id": SENSOR_1, "new_state": _s("off")}))
-
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
             await task
 
+    async def test_69_motion_does_not_extend_the_hold(self, coord, states):
+        """The converse of 68: a sensor still reporting motion when the timer
+        expires doesn't buy extra time either. The configured duration is the
+        whole contract, in both directions — that's what makes it a reliable
+        backstop for a light somebody forgot to turn off."""
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "0")
+        states.put(SENSOR_1, "on")  # still occupied, but daytime (default sun elevation 10.0)
+
+        await coord._run_switch_on_sequence()
+
         coord.hass.services.async_call.assert_any_call(
-            "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
+            "light", "turn_off", {"entity_id": [LIGHT], "transition": 1}, blocking=False
         )
 
-    async def test_70_automation_disabled_during_wait_skips_off(self, coord, states):
-        # Sensors are already clear (defaults), so cleared.wait() resolves
-        # instantly regardless of switch_on_timeout_sec — light_on_time_sec
-        # is what actually needs to stay small here, or this real-sleeps for
-        # the full default 60s grace period.
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
-        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+    async def test_69b_expiry_with_motion_in_the_dark_hands_off_to_motion(self, coord, states):
+        """"Back to auto", not "off": if the zone would act on motion right
+        now, the motion sequence picks the light up rather than the hold
+        cutting it. Turning off unconditionally would drop the light and let
+        the sensor's next report — ~10s away on these hardware timeouts —
+        switch it straight back on, a visible flicker."""
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "0")
+        states.put(SENSOR_1, "on")
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})  # dark enough
 
         with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
             await coord._run_switch_on_sequence()
+            await asyncio.sleep(0)
+
+            # Blocker released, but the light was handed over rather than cut.
+            coord.hass.services.async_call.assert_any_call(
+                "switch", "turn_off",
+                {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
+                blocking=True,
+            )
+            off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
+            assert off_calls == []
+            assert coord._motion_task is not None
+
+            coord._motion_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await coord._motion_task
+
+    async def test_69c_handoff_does_not_self_cancel(self, coord, states):
+        """The handoff creates the motion task directly instead of going
+        through _restart_motion_task, which cancels whatever sits in
+        _motion_task — at that moment, the very task doing the handing off."""
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "0")
+        states.put(SENSOR_1, "on")
+        states.put("sun.sun", "below_horizon", {"elevation": -5.0})
+
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
+            task = asyncio.ensure_future(coord._run_switch_on_sequence())
+            await task  # completes normally, not cancelled
+
+            assert task.done() and not task.cancelled()
+            assert coord._motion_task is not task
+
+            coord._motion_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await coord._motion_task
+
+    async def test_70_automation_disabled_during_hold_skips_off(self, coord, states):
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "0")
+        states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
+
+        await coord._run_switch_on_sequence()
 
         off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
         assert len(off_calls) == 0
 
-    async def test_70b_automation_disabled_during_wait_still_releases_blocker(self, coord, states):
+    async def test_70b_automation_disabled_during_hold_still_releases_blocker(self, coord, states):
         """Disabled mode skips the light-off but must not skip the blocker
         release (2026-08-10 review).
 
@@ -1181,26 +1212,10 @@ class TestSwitchOnHold:
         flipping automation_disabled from the HA UI mid-hold; double-tap-up
         clears the blocker itself and so never exposed it.
         """
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "0")
         states.put(f"switch.{ZONE_ID}_automation_disabled", "on")
 
-        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
-            await coord._run_switch_on_sequence()
-
-        coord.hass.services.async_call.assert_any_call(
-            "switch", "turn_off",
-            {"entity_id": f"switch.{ZONE_ID}_motion_blocker"},
-            blocking=True,
-        )
-
-    async def test_70c_cap_reached_releases_blocker(self, coord, states):
-        """The other non-cancellation exit — the overall auto-shutoff cap —
-        must release the blocker too."""
-        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", str(0.02 / 60))  # ~1.2ms cap
-        states.put(SENSOR_1, "on")
-
-        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
-            await coord._run_switch_on_sequence()
+        await coord._run_switch_on_sequence()
 
         coord.hass.services.async_call.assert_any_call(
             "switch", "turn_off",
@@ -1209,16 +1224,111 @@ class TestSwitchOnHold:
         )
 
     async def test_71_cancelled_error_propagates(self, coord, states):
-        """Sensors already clear (defaults), so the sequence moves straight
-        to the light_on_time_sec grace sleep (default 60s) — cancelling
-        there must propagate cleanly, same pattern as the motion sequence's
-        equivalent guard."""
-        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
-            task = asyncio.ensure_future(coord._run_switch_on_sequence())
-            await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        """Cancellation is the one exit that must *not* release the blocker —
+        whichever newer hold or motion sequence cancelled this one has already
+        raised it and now owns it."""
+        states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")
+
+        task = asyncio.ensure_future(coord._run_switch_on_sequence())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
         off_calls = [c for c in coord.hass.services.async_call.call_args_list if c.args[:2] == ("light", "turn_off")]
         assert len(off_calls) == 0
+        blocker_releases = [
+            c for c in coord.hass.services.async_call.call_args_list
+            if c.args[:2] == ("switch", "turn_off")
+        ]
+        assert blocker_releases == []
+
+
+# ---------------------------------------------------------------------------
+# 72–75  Multiple lights per zone
+#
+# CONF_LIGHT became a list (2026-08-10). Zones configured before that stored a
+# bare entity_id string, so the coordinator normalises on read rather than
+# migrating the config entry — old entries keep working untouched until the
+# next options-flow save writes a list.
+# ---------------------------------------------------------------------------
+
+LIGHT_2 = "light.hallway_accent"
+
+
+class TestMultipleLights:
+
+    def test_72_legacy_string_normalises_to_list(self, coord, entry):
+        entry.options[CONF_LIGHT] = LIGHT
+        assert coord.lights == [LIGHT]
+
+    def test_73_list_passes_through_and_empty_is_empty(self, coord, entry):
+        entry.options[CONF_LIGHT] = [LIGHT, LIGHT_2]
+        assert coord.lights == [LIGHT, LIGHT_2]
+
+        entry.options[CONF_LIGHT] = []
+        assert coord.lights == []
+
+        entry.options[CONF_LIGHT] = None
+        assert coord.lights == []
+
+        del entry.options[CONF_LIGHT]
+        assert coord.lights == []
+
+    async def test_74_all_lights_driven_in_one_call(self, coord, entry):
+        """One service call for the whole list, not one per light — a single
+        call keeps every light on the same context id, so _handle_light_change
+        recognises all the resulting state changes as self-commanded rather
+        than mistaking the second light's change for a switch press."""
+        entry.options[CONF_LIGHT] = [LIGHT, LIGHT_2]
+
+        await coord._light_on(70)
+
+        coord.hass.services.async_call.assert_called_once_with(
+            "light", "turn_on",
+            {"entity_id": [LIGHT, LIGHT_2], "brightness_pct": 70, "transition": 1},
+            blocking=False,
+            context=ANY,
+        )
+        assert len(coord._own_light_context_ids) == 1
+
+    async def test_74b_light_off_drives_all_lights(self, coord, entry):
+        entry.options[CONF_LIGHT] = [LIGHT, LIGHT_2]
+
+        await coord._light_off()
+
+        coord.hass.services.async_call.assert_called_once_with(
+            "light", "turn_off",
+            {"entity_id": [LIGHT, LIGHT_2], "transition": 1},
+            blocking=False,
+        )
+
+    async def test_74c_no_lights_configured_is_a_noop(self, coord, entry):
+        entry.options[CONF_LIGHT] = []
+
+        await coord._light_on()
+        await coord._light_off()
+
+        coord.hass.services.async_call.assert_not_called()
+
+    def test_75_any_light_on_is_true_for_a_partly_lit_zone(self, coord, entry, states):
+        """Any-on, not all-on: a partly lit zone still wants the dim window's
+        brightness applied to the lit part."""
+        entry.options[CONF_LIGHT] = [LIGHT, LIGHT_2]
+        states.put(LIGHT, "off")
+        states.put(LIGHT_2, "on")
+
+        assert coord._any_light_on() is True
+        assert coord._should_reassert_brightness() is True
+
+        states.put(LIGHT_2, "off")
+        assert coord._any_light_on() is False
+        assert coord._should_reassert_brightness() is False
+
+    def test_75b_reassert_blocked_by_override(self, coord, entry, states):
+        entry.options[CONF_LIGHT] = [LIGHT, LIGHT_2]
+        states.put(LIGHT, "on")
+        states.put(f"switch.{ZONE_ID}_motion_blocker", "on")
+
+        assert coord._any_light_on() is True
+        assert coord._should_reassert_brightness() is False

@@ -41,7 +41,7 @@ STEP_USER_SCHEMA = vol.Schema(
             )
         ),
         vol.Required(CONF_LIGHT): EntitySelector(
-            EntitySelectorConfig(domain="light")
+            EntitySelectorConfig(domain="light", multiple=True)
         ),
         vol.Optional(CONF_SWITCH_DEVICE): DeviceSelector(DeviceSelectorConfig()),
     }
@@ -57,7 +57,7 @@ STEP_OPTIONS_SCHEMA = vol.Schema(
             )
         ),
         vol.Required(CONF_LIGHT): EntitySelector(
-            EntitySelectorConfig(domain="light")
+            EntitySelectorConfig(domain="light", multiple=True)
         ),
         vol.Optional(CONF_SWITCH_DEVICE): DeviceSelector(DeviceSelectorConfig()),
     }
@@ -173,6 +173,8 @@ class LuminaryConfigFlow(_HwTimeoutConfirmStep, config_entries.ConfigFlow, domai
                 errors[CONF_AREA] = "area_not_found"
             elif not user_input.get(CONF_SENSORS):
                 errors[CONF_SENSORS] = "no_sensors"
+            elif not user_input.get(CONF_LIGHT):
+                errors[CONF_LIGHT] = "no_lights"
             else:
                 zone_id = slugify(area.name)
                 await self.async_set_unique_id(zone_id)
@@ -225,6 +227,8 @@ class LuminaryOptionsFlow(_HwTimeoutConfirmStep, config_entries.OptionsFlow):
         if user_input is not None:
             if not user_input.get(CONF_SENSORS):
                 errors[CONF_SENSORS] = "no_sensors"
+            elif not user_input.get(CONF_LIGHT):
+                errors[CONF_LIGHT] = "no_lights"
             else:
                 self._zone_options = {
                     CONF_SENSORS: user_input[CONF_SENSORS],
@@ -242,9 +246,14 @@ class LuminaryOptionsFlow(_HwTimeoutConfirmStep, config_entries.OptionsFlow):
                 return self._finish_confirm_timeout()
 
         current = self._config_entry.options
+        # A zone configured before multi-light support stored a bare entity_id
+        # string; the selector is multiple now and needs a list to pre-fill from.
+        current_lights = current.get(CONF_LIGHT) or []
+        if isinstance(current_lights, str):
+            current_lights = [current_lights]
         suggested = {
             CONF_SENSORS: current.get(CONF_SENSORS, []),
-            CONF_LIGHT: current.get(CONF_LIGHT, ""),
+            CONF_LIGHT: list(current_lights),
         }
         if current.get(CONF_SWITCH_DEVICE):
             suggested[CONF_SWITCH_DEVICE] = current[CONF_SWITCH_DEVICE]
