@@ -428,34 +428,54 @@ class ZoneCoordinator:
         switch_on_timeout_sec is an overall cap so it still turns off
         eventually even if the space is never genuinely clear (or a sensor
         is stuck) — that's the actual point of an *auto-shutoff*.
+
+        The grace period watches for any new on-event over its *entire*
+        window rather than sleeping blind and sampling state once at the
+        end — sensors with a short onboard hardware clear-timeout (e.g. 10s)
+        report brief off-blips during continuous real occupancy, so a single
+        instantaneous sample can land mid-blip and wrongly conclude the room
+        is empty (2026-08-10 kitchen incident: cabinet lights kept getting
+        cut mid-cooking well under the 60-minute cap). Any retrigger during
+        the window now resets it, the same guarantee _restart_motion_task
+        already gives the ordinary motion path.
         """
         deadline = asyncio.get_running_loop().time() + self.switch_on_timeout_sec
         try:
             while True:
                 cleared = asyncio.Event()
+                retriggered = asyncio.Event()
 
                 @callback
-                def _on_change(_event: Event) -> None:
+                def _on_change(event: Event) -> None:
+                    new_state = event.data.get("new_state")
+                    if new_state is not None and new_state.state == "on":
+                        retriggered.set()
                     if not any(self.hass.states.is_state(s, "on") for s in self.sensors):
                         cleared.set()
 
                 unsub = async_track_state_change_event(self.hass, self.sensors, _on_change)
-                if not any(self.hass.states.is_state(s, "on") for s in self.sensors):
-                    cleared.set()
                 try:
+                    if not any(self.hass.states.is_state(s, "on") for s in self.sensors):
+                        cleared.set()
                     remaining = max(deadline - asyncio.get_running_loop().time(), 0)
-                    await asyncio.wait_for(cleared.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    break  # cap reached; shut off regardless of activity
+                    try:
+                        await asyncio.wait_for(cleared.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break  # cap reached; shut off regardless of activity
+
+                    retriggered.clear()
+                    remaining = max(deadline - asyncio.get_running_loop().time(), 0)
+                    grace = min(float(self.light_on_time_sec), remaining)
+                    try:
+                        await asyncio.wait_for(retriggered.wait(), timeout=grace)
+                    except asyncio.TimeoutError:
+                        break  # no retrigger for the full grace window; genuinely clear
                 finally:
                     unsub()
 
-                await asyncio.sleep(float(self.light_on_time_sec))
-                if any(self.hass.states.is_state(s, "on") for s in self.sensors):
-                    if asyncio.get_running_loop().time() >= deadline:
-                        break
-                    continue  # re-triggered during the grace period; wait again
-                break
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                # else: re-triggered during the grace period; loop back and wait for clear again
 
             if self.automation_disabled:
                 return

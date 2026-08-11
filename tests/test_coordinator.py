@@ -100,7 +100,7 @@ Switch-triggered on: full brightness + auto-shutoff (_start_switch_on_hold / _ru
   66. Cancels an in-progress motion/hold task first
   67. Sensors clear well within timeout         → light off + blocker off after light_on_time_sec grace
   68. Sensors never clear                       → cap reached, light off anyway
-  69. Sensor re-triggers during grace period    → loops back, stays on
+  69. Sensor re-triggers during grace period    → loops back, stays on (event-driven, not sampled)
   70. automation_disabled during wait           → skipped, light left alone
   71. CancelledError propagates cleanly         → no light off
 """
@@ -1013,29 +1013,43 @@ class TestSwitchOnHold:
         )
 
     async def test_69_retrigger_during_grace_period_loops_and_stays_on(self, coord, states):
-        """Sensors clear, but a new motion trigger fires again during the
-        light_on_time_sec grace sleep → loop back and wait again instead of
-        turning off out from under someone still there."""
-        states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
+        """A new on-event fires again during the grace window → loop back
+        and wait for clear again instead of turning off out from under
+        someone still there.
+
+        Event-driven now, not a single instantaneous end-of-sleep sample
+        (2026-08-10 fix) — a sensor with a short onboard hardware
+        clear-timeout can report a brief off-blip mid-occupancy, and the
+        old sample-once check could land right on top of one of those
+        blips despite continuous real presence.
+        """
+        states.put(f"number.{ZONE_ID}_light_on_time_sec", "60")
         states.put(f"number.{ZONE_ID}_switch_on_timeout_minutes", "60")
         states.put(SENSOR_1, "off")
         states.put(SENSOR_2, "off")
 
-        calls = {"n": 0}
+        captured = []
 
-        def is_state_on_toggle(entity_id, state):
-            # First clear-check pass: sensors are off. During the grace-sleep
-            # re-check: report SENSOR_1 back "on" exactly once, then clear
-            # again on the loop's second pass.
-            calls["n"] += 1
-            if entity_id == SENSOR_1 and calls["n"] == 3:
-                return state == "on"
-            return False
+        def fake_track(hass, entities, cb):
+            captured.append(cb)
+            return lambda: None
 
-        states.is_state = is_state_on_toggle
+        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", fake_track):
+            task = asyncio.ensure_future(coord._run_switch_on_sequence())
+            await asyncio.sleep(0)  # let it reach the grace-period wait (1st pass)
 
-        with patch("custom_components.luminary_ha.coordinator.async_track_state_change_event", return_value=lambda: None):
-            await coord._run_switch_on_sequence()
+            # Retrigger during the grace window
+            states.put(SENSOR_1, "on")
+            captured[-1](Event({"entity_id": SENSOR_1, "new_state": _s("on")}))
+            await asyncio.sleep(0)  # loop back to the top, re-subscribe
+
+            # Let the sensors genuinely clear for the 2nd pass, and shrink
+            # the grace window so it finishes without a real 60s wait
+            states.put(f"number.{ZONE_ID}_light_on_time_sec", "0")
+            states.put(SENSOR_1, "off")
+            captured[-1](Event({"entity_id": SENSOR_1, "new_state": _s("off")}))
+
+            await task
 
         coord.hass.services.async_call.assert_any_call(
             "light", "turn_off", {"entity_id": LIGHT, "transition": 1}, blocking=False
