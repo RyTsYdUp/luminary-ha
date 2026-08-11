@@ -233,15 +233,17 @@ flowchart TD
     SEQ --> W["Wait for ALL sensors OFF\n— capped by Switch On Auto-Shutoff"]
     W --> CL{"Cleared before\nthe cap?"}
     CL -- "No — cap reached" --> OFF
-    CL -- Yes --> GRACE["Sleep light_on_time_sec\n(same grace period as the motion sequence)"]
-    GRACE --> RETRIG{"A sensor came back\non during the grace sleep?"}
+    CL -- Yes --> GRACE["Wait up to light_on_time_sec\nfor any new on-event\n(event-driven — see 2026-08-10 fix)"]
+    GRACE --> RETRIG{"A sensor turned on\nduring that window?"}
     RETRIG -- "Yes, and cap not yet reached" --> W
-    RETRIG -- "No, or cap reached" --> DIS{"automation_disabled\nbecame on during the wait?"}
+    RETRIG -- "No — window elapsed clear,\nor cap reached" --> DIS{"automation_disabled\nbecame on during the wait?"}
     DIS -- Yes --> HELD(["Stop — keep light on,\ndumb mode took over"])
     DIS -- No --> OFF["Light OFF\nmotion_blocker OFF"]
 ```
 
 **Why this needs its own loop, unlike the main motion sequence (§2):** the main sequence gets torn down and restarted fresh by every new motion trigger via `_restart_motion_task` — the `asyncio.Task` equivalent of `mode: restart`. But `motion_blocker` being ON is exactly what stops `_handle_sensor_change` from calling `_restart_motion_task` in the first place (§2, first branch) — that's the whole point of the flag. So this sequence can't rely on being externally restarted by fresh motion the way §2 does; it has to watch for re-triggers itself and loop, or a person still in the hallway would get the light cut out from under them the moment the sensors happened to all read momentarily clear.
+
+**2026-08-10 incident (kitchen):** the grace-period check originally slept `light_on_time_sec` blind, then sampled sensor state *once*, at that exact instant, to decide `RETRIG`. Sensors with a short onboard hardware clear-timeout (10s — see §6, true of every sensor in every zone) report brief off-blips during continuous real occupancy, so a single instantaneous sample could land mid-blip and wrongly conclude the room was empty. Confirmed via the kitchen zone's history: cabinet lights kept getting shut off 2–11 minutes into a cooking session, well under the configured 60-minute cap, while the motion sensor was still actively cycling throughout. **Fix:** `GRACE` now watches for any new on-event over the *entire* window via a tracked state-change listener (an `asyncio.Event`, not a sleep-then-sample), giving this loop the same continuous-clear guarantee `_restart_motion_task` already gives §2. The cap and the always-full-brightness/always-eventually-off-regardless-of-daytime behavior above are unchanged.
 
 ---
 
